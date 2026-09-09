@@ -43,6 +43,10 @@ st.markdown("""
 .score { font-size:30px; font-weight:800; float:right; }
 .team { font-size:18px; font-weight:700; margin:8px 0; min-height:38px; }
 .meta { color:#9ca3af; font-size:13px; }
+.update-bar { border:1px solid rgba(128,128,128,.30); border-radius:12px; padding:9px 12px; margin:8px 0 14px; font-size:13px; }
+.update-good { color:#22c55e; font-weight:700; }
+.update-warn { color:#eab308; font-weight:700; }
+.update-bad { color:#ef4444; font-weight:700; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -594,7 +598,13 @@ def get_all_scoreboards(timezone_name, target_date=None):
                     errors.append(f"{sport_name} ({sport_slug}/{division}, {fetch_date}): {exc}")
                 except Exception as exc:
                     errors.append(f"{sport_name} ({sport_slug}/{division}, {fetch_date}): {type(exc).__name__}: {exc}")
-    return {"events": combined, "errors": errors, "diagnostics": diagnostics}
+    fetched_at = datetime.now(ZoneInfo(timezone_name)).isoformat()
+    return {
+        "events": combined,
+        "errors": errors,
+        "diagnostics": diagnostics,
+        "fetched_at": fetched_at,
+    }
 
 
 def _extract_conference(team):
@@ -927,14 +937,43 @@ def get_game_watch_info(game_id):
     return _collect_watch_info(detail)
 
 
+def _live_status_text(game):
+    """Use familiar sport-specific live labels instead of generic Period N."""
+    if game.get("state") != "in":
+        return ""
+    sport = game.get("sport", "")
+    period = game.get("period", "")
+    clock = game.get("clock", "")
+    try:
+        p = int(period)
+    except (TypeError, ValueError):
+        p = None
+    if "Football" in sport and p is not None:
+        label = f"Q{p}"
+    elif "Basketball" in sport and p is not None:
+        label = "1st Half" if p == 1 else ("2nd Half" if p == 2 else f"OT{p-2}")
+    elif "Soccer" in sport and p is not None:
+        label = "1st Half" if p == 1 else ("2nd Half" if p == 2 else f"OT{p-2}")
+    elif "Volleyball" in sport and p is not None:
+        label = f"Set {p}"
+    elif sport in ("⚾ Baseball", "🥎 Softball") and p is not None:
+        label = f"Inning {p}"
+    elif period:
+        label = f"Period {period}"
+    else:
+        label = "LIVE"
+    return f"{label} • {clock}" if clock else label
+
+
 def render_game(game, favorite=False, close=False, rankings=None, records=None):
-    status_badge = "🔴 LIVE" if game["state"] == "in" else ("FINAL" if game["state"] == "post" else "UPCOMING")
+    status_badge = "🔴 LIVE NOW" if game["state"] == "in" else ("FINAL" if game["state"] == "post" else "UPCOMING")
+    live_detail = _live_status_text(game)
     meta = " • ".join(x for x in [
         status_badge,
         game["division"],
         "⭐ FAVORITE" if favorite else "",
         "🔥 CLOSE" if close else "",
-        game["detail"],
+        live_detail or game["detail"],
         f"TV: {', '.join(game['broadcasts'])}" if game["broadcasts"] else "",
     ] if x)
 
@@ -1122,6 +1161,42 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, c
         # future games leak into the selected date. Use the actual parsed
         # local event date as the source of truth.
         games = [g for g in games if g.get("event_date") == selected_date]
+
+        fetched_at_raw = data.get("fetched_at")
+        fetched_at = None
+        if fetched_at_raw:
+            try:
+                fetched_at = datetime.fromisoformat(fetched_at_raw)
+            except (TypeError, ValueError):
+                pass
+        now_local = datetime.now(ZoneInfo(selected_timezone))
+        age_seconds = max(0, (now_local - fetched_at).total_seconds()) if fetched_at else None
+        errors = data.get("errors", [])
+        failed_sports = sorted({str(e).split(" (")[0] for e in errors})
+        if errors:
+            connection_text = "⚠️ NCAA Data: Partial"
+            connection_class = "update-warn"
+            connection_detail = f"{len(errors)} feed error{'s' if len(errors) != 1 else ''}"
+            if failed_sports:
+                connection_detail += " • " + ", ".join(failed_sports[:3])
+        else:
+            connection_text = "🟢 NCAA Data: Connected"
+            connection_class = "update-good"
+            connection_detail = "All selected NCAA feeds responded"
+        if age_seconds is None:
+            freshness_class = "update-bad"
+            freshness_text = "Scoreboard update time unavailable"
+        elif age_seconds < 60:
+            freshness_class = "update-good"
+            freshness_text = f"Last updated {int(age_seconds)} sec ago"
+        elif age_seconds < 180:
+            freshness_class = "update-warn"
+            freshness_text = f"Last updated {int(age_seconds // 60)} min ago"
+        else:
+            freshness_class = "update-bad"
+            freshness_text = f"Last updated {int(age_seconds // 60)} min ago"
+        updated_display = fetched_at.strftime("%I:%M:%S %p %Z").lstrip("0") if fetched_at else "Unknown"
+        st.markdown(f'<div class="update-bar"><span class="{freshness_class}">🕐 {freshness_text}</span> &nbsp;•&nbsp; Updated at {updated_display} &nbsp;•&nbsp; Auto-refresh every {REFRESH_SECONDS}s<br><span class="{connection_class}">{connection_text}</span> <span class="meta">• {connection_detail}</span></div>', unsafe_allow_html=True)
     except Exception as exc:
         st.error(f"Could not retrieve scores: {type(exc).__name__}: {exc}")
         st.stop()
@@ -1135,7 +1210,7 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, c
 
     if show_diagnostics:
         with st.expander("🛠️ Scoreboard Diagnostics", expanded=True):
-            st.write({"selected_time_zone": timezone_label, "selected_date": str(selected_date), "raw_combined_event_count": len(data.get("events", [])), "parsed_game_count": len(games), "errors": data.get("errors", [])})
+            st.write({"selected_time_zone": timezone_label, "selected_date": str(selected_date), "fetched_at": data.get("fetched_at"), "raw_combined_event_count": len(data.get("events", [])), "parsed_game_count": len(games), "errors": data.get("errors", [])})
             for diag in data.get("diagnostics", []):
                 with st.container(border=True):
                     st.markdown(f"**{diag.get('sport','Unknown sport')}**")
