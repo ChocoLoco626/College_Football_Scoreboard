@@ -1352,6 +1352,59 @@ def get_record_maps_for_games(games):
             maps[sport] = {}
     return maps
 
+def _extract_current_volleyball_points(competitor, period_value=""):
+    """Extract the current volleyball set points from scoreboard competitor data.
+
+    NCAA scoreboard payloads can expose per-set values directly on each
+    competitor (usually as linescores/periodScores). This is preferable to
+    making a separate game-detail request on every refresh.
+    """
+    if not isinstance(competitor, dict):
+        return None, None
+
+    def key_norm(key):
+        return str(key).lower().replace("_", "").replace("-", "")
+
+    def num(value):
+        try:
+            if isinstance(value, bool) or value is None:
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    candidate_keys = {
+        "linescores", "linescore", "periodscores", "periodscore",
+        "setscores", "setscore", "scoresbyset", "scorebyset",
+        "scoresbyperiod", "scorebyperiod",
+    }
+
+    # Prefer a linescore array. For a live volleyball match, the last
+    # populated period is the current set.
+    for key, value in competitor.items():
+        if key_norm(key) not in candidate_keys or not isinstance(value, list):
+            continue
+        parsed = []
+        for row in value:
+            score = None
+            period = None
+            if isinstance(row, dict):
+                period = row.get("period", row.get("set", row.get("number")))
+                score = row.get("score", row.get("value", row.get("points", row.get("displayValue"))))
+            else:
+                score = row
+            if isinstance(score, str):
+                m = re.search(r"(\d+)", score)
+                score = m.group(1) if m else None
+            score = num(score)
+            if score is not None and 0 <= score <= 60:
+                parsed.append((period, score))
+        if parsed:
+            return parsed[-1][1], len(parsed)
+
+    return None, None
+
+
 def parse_games(data, timezone_name):
     games = []
     for event in data.get("events", []):
@@ -1371,6 +1424,13 @@ def parse_games(data, timezone_name):
 
         hs, aws = score(home), score(away)
         status = event.get("status", {})
+        volleyball_current_away = None
+        volleyball_current_home = None
+        volleyball_linescore_count = None
+        if event.get("_sport_name") == "🏐 Women's Volleyball":
+            volleyball_current_away, away_line_count = _extract_current_volleyball_points(away, status.get("period", ""))
+            volleyball_current_home, home_line_count = _extract_current_volleyball_points(home, status.get("period", ""))
+            volleyball_linescore_count = away_line_count or home_line_count
         type_info = status.get("type", {})
         state = type_info.get("state", "pre")
 
@@ -1411,6 +1471,9 @@ def parse_games(data, timezone_name):
             "event_context": event.get("_event_context", ""),
             "tournament_name": event.get("_tournament_name", ""),
             "round_name": event.get("_round_name", ""),
+            "volleyball_current_set": volleyball_linescore_count,
+            "volleyball_current_away": volleyball_current_away,
+            "volleyball_current_home": volleyball_current_home,
         })
     # Volleyball set/point details used to be fetched serially, and each game
     # could trigger both /game and /boxscore. That made a busy volleyball slate
@@ -1421,6 +1484,7 @@ def parse_games(data, timezone_name):
         game for game in games
         if game.get("sport") == "🏐 Women's Volleyball" and game.get("state") in ("in", "post")
         and game.get("id") and not str(game.get("id")).startswith("ncaa-")
+        and (game.get("state") == "post" or game.get("volleyball_current_away") is None or game.get("volleyball_current_home") is None)
     ]
 
     def fetch_vb_info(game):
@@ -1443,9 +1507,9 @@ def parse_games(data, timezone_name):
                 game["away_points_by_set"] = info["away_points"]
                 game["home_points_by_set"] = info["home_points"]
                 game["volleyball_set_scores"] = info["rows"]
-                game["volleyball_current_set"] = info.get("current_set_number")
-                game["volleyball_current_away"] = info.get("current_set_away")
-                game["volleyball_current_home"] = info.get("current_set_home")
+                game["volleyball_current_set"] = info.get("current_set_number") or game.get("volleyball_current_set")
+                game["volleyball_current_away"] = info.get("current_set_away") if info.get("current_set_away") is not None else game.get("volleyball_current_away")
+                game["volleyball_current_home"] = info.get("current_set_home") if info.get("current_set_home") is not None else game.get("volleyball_current_home")
                 game["diff"] = abs(info["away_sets"] - info["home_sets"])
 
     return games
