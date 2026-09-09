@@ -1405,7 +1405,108 @@ def _extract_current_volleyball_points(competitor, period_value=""):
     return None, None
 
 
-def parse_games(data, timezone_name):
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_espn_volleyball_scoreboard(target_date):
+    """Fetch ESPN women's college volleyball only as a fallback for live set points."""
+    if not target_date:
+        return None
+    try:
+        date_str = target_date.strftime("%Y%m%d") if hasattr(target_date, "strftime") else str(target_date).replace("-", "")
+        url = "https://site.api.espn.com/apis/site/v2/sports/volleyball/womens-college-volleyball/scoreboard"
+        response = requests.get(url, params={"dates": date_str}, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+        response.raise_for_status()
+        return response.json()
+    except Exception:
+        return None
+
+
+def _team_names_match(name_a, name_b):
+    """Loose team-name matcher for NCAA ↔ ESPN volleyball feeds."""
+    def norm(value):
+        text = _normalize_team_name(value or "")
+        for token in ("university", "college", "state", "the"):
+            text = text.replace(token, " ")
+        return " ".join(text.split())
+    a, b = norm(name_a), norm(name_b)
+    if not a or not b:
+        return False
+    return a == b or a in b or b in a
+
+
+def _extract_espn_current_vb_points(event, away_name, home_name):
+    """Extract ESPN's current in-progress volleyball set points."""
+    if not isinstance(event, dict):
+        return None, None, None
+    competition = (event.get("competitions") or [{}])[0]
+    competitors = competition.get("competitors") or []
+    away = next((c for c in competitors if c.get("homeAway") == "away"), None)
+    home = next((c for c in competitors if c.get("homeAway") == "home"), None)
+    if not away or not home:
+        return None, None, None
+    if not (_team_names_match(away.get("team", {}).get("displayName"), away_name)
+            and _team_names_match(home.get("team", {}).get("displayName"), home_name)):
+        return None, None, None
+
+    def linescores(c):
+        values = []
+        for row in c.get("linescores") or []:
+            if not isinstance(row, dict):
+                continue
+            raw = row.get("value", row.get("score", row.get("displayValue")))
+            try:
+                if isinstance(raw, str) and "-" in raw:
+                    raw = raw.split("-")[-1]
+                value = int(float(raw))
+            except (TypeError, ValueError):
+                continue
+            values.append(value)
+        return values
+
+    away_sets = linescores(away)
+    home_sets = linescores(home)
+    if not away_sets or not home_sets:
+        return None, None, None
+
+    count = min(len(away_sets), len(home_sets))
+    if count == 0:
+        return None, None, None
+    period = event.get("status", {}).get("period") or event.get("status", {}).get("type", {}).get("shortDetail", "")
+    try:
+        set_no = int(period)
+    except (TypeError, ValueError):
+        set_no = count
+    set_no = max(1, min(set_no, count))
+    return away_sets[set_no - 1], home_sets[set_no - 1], set_no
+
+
+def apply_espn_volleyball_fallback(games, target_date):
+    """Fill only missing live volleyball point scores from ESPN."""
+    targets = [
+        g for g in games
+        if g.get("sport") == "🏐 Women's Volleyball"
+        and g.get("state") == "in"
+        and (g.get("volleyball_current_away") is None or g.get("volleyball_current_home") is None)
+    ]
+    if not targets:
+        return games
+
+    payload = get_espn_volleyball_scoreboard(target_date)
+    if not payload:
+        return games
+    events = payload.get("events") or []
+    for game in targets:
+        for event in events:
+            away, home, set_no = _extract_espn_current_vb_points(event, game.get("away", ""), game.get("home", ""))
+            if away is None or home is None:
+                continue
+            game["volleyball_current_away"] = away
+            game["volleyball_current_home"] = home
+            game["volleyball_current_set"] = set_no
+            break
+    return games
+
+def parse_games(data, timezone_name, target_date=None):
     games = []
     for event in data.get("events", []):
         competition = (event.get("competitions") or [{}])[0]
@@ -1512,6 +1613,7 @@ def parse_games(data, timezone_name):
                 game["volleyball_current_home"] = info.get("current_set_home") if info.get("current_set_home") is not None else game.get("volleyball_current_home")
                 game["diff"] = abs(info["away_sets"] - info["home_sets"])
 
+    games = apply_espn_volleyball_fallback(games, target_date)
     return games
 
 
@@ -1778,7 +1880,10 @@ def render_game(game, favorite=False, close=False, rankings=None, records=None, 
 
     clock = ""
     if game["state"] == "in":
-        clock = f" • Period {game['period']} • {game['clock']}" if game["clock"] else f" • Period {game['period']}"
+        if game.get("sport") == "🏐 Women's Volleyball":
+            clock = f" • Period {game['period']}" if game.get("period") else ""
+        else:
+            clock = f" • Period {game['period']} • {game['clock']}" if game['clock'] else f" • Period {game['period']}"
 
     start_time = ""
     countdown = ""
