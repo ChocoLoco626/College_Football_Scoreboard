@@ -788,6 +788,36 @@ def parse_games(data, timezone_name):
     return games
 
 
+def dedupe_games(games):
+    """Remove duplicate NCAA events that can appear in multiple football feeds.
+
+    NCAA can expose the same football matchup through overlapping FBS/FCS
+    scoreboard responses with different event IDs. Prefer the event ID when
+    available, but also use matchup/date/time as a fallback so the user sees
+    each game only once.
+    """
+    unique = []
+    seen_ids = set()
+    seen_matchups = set()
+    for game in games:
+        event_id = str(game.get("id") or "").strip()
+        matchup = (
+            _normalize_team_name(game.get("away")),
+            _normalize_team_name(game.get("home")),
+            str(game.get("event_date") or ""),
+            str(game.get("event_time") or ""),
+        )
+        if event_id and event_id in seen_ids:
+            continue
+        if matchup in seen_matchups:
+            continue
+        if event_id:
+            seen_ids.add(event_id)
+        seen_matchups.add(matchup)
+        unique.append(game)
+    return unique
+
+
 def _normalize_team_name(name):
     return " ".join(str(name or "").lower().replace("&", "and").replace(".", "").split())
 
@@ -1085,6 +1115,7 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, c
     try:
         data = get_all_scoreboards(selected_timezone, selected_date)
         games = parse_games(data, selected_timezone)
+        games = dedupe_games(games)
 
         # The NCAA football scoreboard can sometimes return the next slate of
         # games even when a specific date was requested. Never let those
