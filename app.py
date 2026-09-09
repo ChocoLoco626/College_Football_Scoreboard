@@ -56,176 +56,136 @@ def today_in_timezone(timezone_name):
     return datetime.now(ZoneInfo(timezone_name)).date()
 
 
-def get_ncaa_volleyball_scoreboard(timezone_name):
-    """Reliable Division I women's volleyball fallback using the NCAA scoreboard feed.
-
-    ESPN's public volleyball scoreboard is currently inconsistent for upcoming
-    matches even though ESPN's own web scoreboard lists them. The NCAA D-I
-    scoreboard provides the same contests and is used as the primary volleyball
-    source, with ESPN remaining the source for the other sports.
-    """
+def get_ncaa_scoreboard(sport_slug, division, sport_name, timezone_name):
+    """Fetch a dated NCAA Division I scoreboard and normalize it to our app format."""
     local_date = today_in_timezone(timezone_name)
     date_path = local_date.strftime("%Y/%m/%d")
-    url = f"https://ncaa-api.henrygd.me/scoreboard/volleyball-women/d1/{date_path}"
+    url = f"https://ncaa-api.henrygd.me/scoreboard/{sport_slug}/{division}/{date_path}"
+
     response = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
     response.raise_for_status()
     payload = response.json()
 
-    events = []
     raw_games = payload.get("games", []) if isinstance(payload, dict) else []
+    events = []
+
     for item in raw_games:
         game = item.get("game", item) if isinstance(item, dict) else {}
         if not isinstance(game, dict):
             continue
+
         away = game.get("away", {}) or {}
         home = game.get("home", {}) or {}
         away_names = away.get("names", {}) or {}
         home_names = home.get("names", {}) or {}
+
         away_name = away_names.get("full") or away_names.get("short") or "Away"
         home_name = home_names.get("full") or home_names.get("short") or "Home"
-        game_id = str(game.get("gameID") or game.get("gameId") or "ncaa-" + away_name + "-" + home_name)
+        game_id = str(game.get("gameID") or game.get("gameId") or f"ncaa-{away_name}-{home_name}")
 
-        start = game.get("startTime") or game.get("startTimeEpoch") or game.get("date")
-        event_date = local_date
+        # Prefer NCAA's epoch timestamp; otherwise combine startDate + startTime.
         event_dt = None
-        if isinstance(start, (int, float)) or (isinstance(start, str) and start.isdigit()):
-            event_dt = datetime.fromtimestamp(float(start) / 1000 if float(start) > 100000000000 else float(start), tz=ZoneInfo("UTC")).astimezone(ZoneInfo(timezone_name))
-            event_date = event_dt.date()
-        elif isinstance(start, str) and start:
+        epoch = game.get("startTimeEpoch")
+        if epoch not in (None, ""):
             try:
-                event_dt = datetime.fromisoformat(start.replace("Z", "+00:00")).astimezone(ZoneInfo(timezone_name))
-                event_date = event_dt.date()
-            except ValueError:
-                pass
+                value = float(epoch)
+                if value > 100000000000:
+                    value /= 1000
+                event_dt = datetime.fromtimestamp(value, tz=ZoneInfo("UTC")).astimezone(ZoneInfo(timezone_name))
+            except (TypeError, ValueError, OverflowError):
+                event_dt = None
+
+        if event_dt is None:
+            start_date = game.get("startDate") or local_date.isoformat()
+            start_time = game.get("startTime") or ""
+            if isinstance(start_date, str) and isinstance(start_time, str) and start_time.strip():
+                import re
+                text = start_time.strip().replace(" ET", "").replace(" EST", "").replace(" EDT", "")
+                match = re.match(r"^(\d{1,2}:\d{2})\s*(AM|PM)?", text, re.I)
+                if match:
+                    clock = match.group(1)
+                    ampm = match.group(2) or ""
+                    try:
+                        naive = datetime.strptime(
+                            f"{start_date[:10]} {clock} {ampm}".strip(),
+                            "%Y-%m-%d %I:%M %p" if ampm else "%Y-%m-%d %H:%M",
+                        )
+                        # NCAA startTime is presented in Eastern Time in the old-format feed.
+                        event_dt = naive.replace(tzinfo=ZoneInfo("America/New_York")).astimezone(ZoneInfo(timezone_name))
+                    except ValueError:
+                        pass
 
         state_raw = str(game.get("gameState", game.get("status", "P"))).upper()
         state = "in" if state_raw in ("I", "LIVE", "IN") else ("post" if state_raw in ("F", "FINAL", "POST") else "pre")
-        try:
-            away_score = int(away.get("score", 0))
-        except (TypeError, ValueError):
-            away_score = 0
-        try:
-            home_score = int(home.get("score", 0))
-        except (TypeError, ValueError):
-            home_score = 0
 
+        def safe_score(team):
+            try:
+                return int(team.get("score", 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        away_score = safe_score(away)
+        home_score = safe_score(home)
+
+        # Normalize NCAA's response into the same shape the existing renderer uses.
         events.append({
             "id": game_id,
             "date": event_dt.isoformat() if event_dt else None,
-            "status": {"type": {"state": state, "shortDetail": game.get("statusDetail", "")}},
+            "status": {
+                "type": {
+                    "state": state,
+                    "shortDetail": game.get("finalMessage") or game.get("startTime") or "",
+                    "detail": game.get("finalMessage") or game.get("startTime") or "",
+                },
+                "displayClock": game.get("contestClock", ""),
+                "period": game.get("currentPeriod", ""),
+            },
             "competitions": [{
                 "competitors": [
                     {"homeAway": "away", "team": {"id": str(away.get("id", "")), "displayName": away_name, "logo": away.get("logo", "")}, "score": str(away_score)},
                     {"homeAway": "home", "team": {"id": str(home.get("id", "")), "displayName": home_name, "logo": home.get("logo", "")}, "score": str(home_score)},
                 ],
-                "broadcasts": [],
+                "broadcasts": ([{"names": [game.get("network")]}] if game.get("network") else []),
             }],
-            "_sport_name": "🏐 Women's Volleyball",
-            "_sport": "volleyball",
-            "_league": "womens-college-volleyball",
-            "_division": "NCAA D-I",
+            "_sport_name": sport_name,
+            "_sport": sport_slug,
+            "_league": sport_slug,
+            "_division": "NCAA D-I" if division == "d1" else division.upper(),
         })
-    return {"events": events, "_diagnostic": {
-        "source": "NCAA D-I volleyball",
-        "url": url,
-        "payload_type": type(payload).__name__,
-        "payload_keys": list(payload.keys()) if isinstance(payload, dict) else [],
-        "raw_game_count": len(raw_games),
-        "parsed_event_count": len(events),
-        "sample_raw_keys": [list(x.keys()) if isinstance(x, dict) else type(x).__name__ for x in raw_games[:5]],
-        "sample_games": [
-            {
-                "away": ((x.get("game", x) or {}).get("away", {}) or {}).get("names", {}) if isinstance(x, dict) else {},
-                "home": ((x.get("game", x) or {}).get("home", {}) or {}).get("names", {}) if isinstance(x, dict) else {},
-                "startTime": ((x.get("game", x) or {}).get("startTime") if isinstance(x, dict) else None),
-                "gameState": ((x.get("game", x) or {}).get("gameState") if isinstance(x, dict) else None),
-            } for x in raw_games[:5]
-        ],
-    }}
 
-
-def get_scoreboard(sport, league, group=None, timezone_name=TIMEZONES[DEFAULT_TIMEZONE]):
-    """Fetch today's ESPN schedule, with a tomorrow-inclusive fallback.
-
-    The important part is that EVERY supported sport follows this exact path,
-    rather than volleyball having special-case behavior.
-    """
-    url = f"{ESPN_BASE}/{sport}/{league}/scoreboard"
-    today = today_in_timezone(timezone_name)
-    yesterday = today - timedelta(days=1)
-    tomorrow = today + timedelta(days=1)
-    today_str = today.strftime("%Y%m%d")
-    window_str = f"{today_str}-{tomorrow.strftime('%Y%m%d')}"
-
-    base_params = {"limit": 1000}
-
-    # Most NCAA scoreboards benefit from groups=50, but ESPN's women's
-    # volleyball feed is more reliable without that filter.  We therefore
-    # try both forms whenever a group was supplied, merging the results.
-    request_variants = []
-    if group is not None:
-        request_variants.append({"limit": 1000, "groups": str(group)})
-        request_variants.append({"limit": 1000})
-    else:
-        request_variants.append({"limit": 1000})
-
-    # ESPN's college volleyball feed can be inconsistent about which calendar
-    # date is returned for events near midnight/time-zone boundaries. Fetch a
-    # slightly wider window, then the app performs the authoritative local
-    # time-zone filtering after parsing each event timestamp.
-    date_windows = [
-        today_str,
-        f"{yesterday.strftime('%Y%m%d')}-{tomorrow.strftime('%Y%m%d')}",
-    ]
-
-    merged_events = {}
-    last_data = {"events": []}
-    diagnostics = {
-        "source": f"ESPN {sport}/{league}",
-        "url": url,
-        "requests": [],
-        "merged_event_count": 0,
+    return {
+        "events": events,
+        "_diagnostic": {
+            "source": "NCAA API",
+            "url": url,
+            "sport": sport_slug,
+            "division": division,
+            "raw_game_count": len(raw_games),
+            "parsed_event_count": len(events),
+            "sample_games": [
+                {
+                    "away": ((x.get("game", x) or {}).get("away", {}) or {}).get("names", {}) if isinstance(x, dict) else {},
+                    "home": ((x.get("game", x) or {}).get("home", {}) or {}).get("names", {}) if isinstance(x, dict) else {},
+                    "startTime": ((x.get("game", x) or {}).get("startTime") if isinstance(x, dict) else None),
+                    "startDate": ((x.get("game", x) or {}).get("startDate") if isinstance(x, dict) else None),
+                    "gameState": ((x.get("game", x) or {}).get("gameState") if isinstance(x, dict) else None),
+                } for x in raw_games[:5]
+            ],
+        },
     }
-    for date_value in date_windows:
-        for variant in request_variants:
-            params = {**variant, "dates": date_value}
-            response = requests.get(
-                url, params=params, timeout=12,
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            response.raise_for_status()
-            data = response.json()
-            last_data = data
-            diagnostics["requests"].append({
-                "dates": date_value,
-                "params": params,
-                "http_status": response.status_code,
-                "event_count": len(data.get("events", [])),
-                "top_keys": list(data.keys())[:20] if isinstance(data, dict) else [],
-            })
-            for event in data.get("events", []):
-                event_id = str(event.get("id", ""))
-                if event_id:
-                    merged_events[event_id] = event
 
-    # Final fallback: ESPN's default scoreboard date. Some college feeds can
-    # temporarily return a sparse dated response, especially volleyball.
-    if not merged_events:
-        response = requests.get(
-            url, params={"limit": 1000}, timeout=12,
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        response.raise_for_status()
-        data = response.json()
-        for event in data.get("events", []):
-            event_id = str(event.get("id", ""))
-            if event_id:
-                merged_events[event_id] = event
 
-    diagnostics["merged_event_count"] = len(merged_events)
-    result = {"events": list(merged_events.values())} if merged_events else last_data
-    result["_diagnostic"] = diagnostics
-    return result
+# NCAA is now the primary source for every supported college sport.
+NCAA_SPORTS = {
+    "🏈 Football": [("football", "fbs"), ("football", "fcs")],
+    "⚽ Men's Soccer": [("soccer-men", "d1")],
+    "⚽ Women's Soccer": [("soccer-women", "d1")],
+    "🏀 Men's Basketball": [("basketball-men", "d1")],
+    "🏀 Women's Basketball": [("basketball-women", "d1")],
+    "🏐 Women's Volleyball": [("volleyball-women", "d1")],
+    "⚾ Baseball": [("baseball", "d1")],
+    "🥎 Softball": [("softball", "d1")],
+}
 
 
 @st.cache_data(ttl=20)
@@ -233,23 +193,19 @@ def get_all_scoreboards(timezone_name):
     combined = []
     errors = []
     diagnostics = []
-    for sport_name, configs in SPORTS.items():
-        for sport, league, division, group in configs:
+    for sport_name, configs in NCAA_SPORTS.items():
+        for sport_slug, division in configs:
             try:
-                if sport_name == "🏐 Women's Volleyball":
-                    data = get_ncaa_volleyball_scoreboard(timezone_name)
-                else:
-                    data = get_scoreboard(sport, league, group, timezone_name)
+                data = get_ncaa_scoreboard(sport_slug, division, sport_name, timezone_name)
                 if data.get("_diagnostic"):
                     diagnostics.append({"sport": sport_name, **data["_diagnostic"]})
                 for event in data.get("events", []):
                     event["_sport_name"] = sport_name
-                    event["_sport"] = sport
-                    event["_league"] = league
-                    event["_division"] = division
                     combined.append(event)
             except requests.RequestException as exc:
-                errors.append(f"{sport_name}: {exc}")
+                errors.append(f"{sport_name} ({sport_slug}/{division}): {exc}")
+            except Exception as exc:
+                errors.append(f"{sport_name} ({sport_slug}/{division}): {type(exc).__name__}: {exc}")
     return {"events": combined, "errors": errors, "diagnostics": diagnostics}
 
 
@@ -380,7 +336,7 @@ with st.sidebar:
 @st.fragment(run_every=30)
 def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold):
     st.title("🏆 College Sports Live")
-    st.caption(f"ESPN college scores • Showing times in {timezone_label}")
+    st.caption(f"NCAA college scores • Showing times in {timezone_label}")
 
     try:
         data = get_all_scoreboards(selected_timezone)
@@ -492,7 +448,7 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold):
             team_games = [g for g in games if g["home_id"] == favorite_id or g["away_id"] == favorite_id]
             st.markdown(f"### ⭐ {favorite_name}")
             if not team_games:
-                st.caption("No games found on today's ESPN scoreboards.")
+                st.caption("No games found on today's NCAA scoreboards.")
             else:
                 team_games.sort(key=lambda g: (g["state"] != "in", g["event_time"] or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone))))
                 for game in team_games:
@@ -505,7 +461,7 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold):
     if not upcoming_today:
         st.info("No upcoming games are currently listed by ESPN for today in the selected sports.")
     else:
-        st.caption("Games scheduled for later today, according to ESPN.")
+        st.caption("Games scheduled for later today, according to the NCAA.")
         for game in upcoming_today:
             render_game(game, favorite=is_favorite(game, favorites), close=False)
 
