@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 import base64
 import re
+import json
 import requests
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -340,8 +341,15 @@ def get_ncaa_volleyball_boxscore(game_id):
     try:
         hash_value="4320484382257c2a7ac3be318db2dee09a7fb74029448825c285d5dbdda365ae"
         url="https://sdataprod.ncaa.com/"
-        params={"extensions":'{"persistedQuery":{"version":1,"sha256Hash":"'+hash_value+'"}}',"variables":'{"contestId":"'+str(game_id)+'","staticTestEnv":null}'}
-        r=requests.get(url,params=params,timeout=10,headers={"User-Agent":"Mozilla/5.0"})
+        # The NCAA GraphQL endpoint expects both the persisted-query hash and
+        # the query name. The previous versions omitted queryName, which can
+        # return a valid HTTP response without the volleyball team-stats data.
+        params={
+            "queryName":"TeamStatsVolleyball",
+            "extensions":'{"persistedQuery":{"version":1,"sha256Hash":"'+hash_value+'"}}',
+            "variables":json.dumps({"contestId": int(str(game_id)), "staticTestEnv": None}, separators=(",", ":")),
+        }
+        r=requests.get(url,params=params,timeout=10,headers={"User-Agent":"Mozilla/5.0","Referer":"https://www.ncaa.com/"})
         r.raise_for_status(); return r.json()
     except Exception: return None
 
