@@ -397,6 +397,47 @@ def _extract_volleyball_set_scores(payload, away_id="", home_id=""):
             if rows:
                 return rows
 
+    # Generic fallback: NCAA game-center responses can expose volleyball
+    # periods/sets under sport-specific names. Look for any nested objects that
+    # clearly represent a numbered set/period and contain two team scores.
+    generic_rows = []
+    for obj in _walk_json(payload):
+        if not isinstance(obj, dict):
+            continue
+        label = obj.get("period") or obj.get("set") or obj.get("setNumber") or obj.get("periodNumber") or obj.get("periodName") or obj.get("setName")
+        if label is None:
+            continue
+        # Avoid treating generic game-period strings like "Set 1" without scores as rows.
+        score_candidates = []
+        for key, value in obj.items():
+            nk = key_norm(key)
+            if nk in {"score", "scores", "setscore", "periodscore", "scorevalue", "points"} or "score" in nk or nk in {"away", "home"}:
+                if isinstance(value, (dict, list, tuple, str)):
+                    pair = parse_score_pair(value)
+                    if pair:
+                        score_candidates.append(pair)
+        if len(score_candidates) == 1:
+            a, h = score_candidates[0]
+            generic_rows.append({"Set": str(label), "Away": a, "Home": h})
+        elif len(score_candidates) >= 2:
+            # Prefer the first pair; duplicate representations are common.
+            a, h = score_candidates[0]
+            generic_rows.append({"Set": str(label), "Away": a, "Home": h})
+    if generic_rows:
+        # Keep the first occurrence of each set label and require sensible
+        # volleyball scores to avoid accidentally parsing player statistics.
+        cleaned = []
+        seen_labels = set()
+        for row in generic_rows:
+            key = row["Set"]
+            if key in seen_labels:
+                continue
+            if 0 <= row["Away"] <= 60 and 0 <= row["Home"] <= 60:
+                seen_labels.add(key)
+                cleaned.append(row)
+        if cleaned:
+            return cleaned
+
     # Fallback: locate team objects that contain an array of set/period scores.
     team_rows = []
     for obj in _walk_json(payload):
@@ -515,18 +556,6 @@ def get_volleyball_set_info(game_id, away_id="", home_id=""):
             "current_set_home": current_set["Home"] if current_set else None,
         }
     return None
-
-
-def _volleyball_set_score_text(game):
-    """Return volleyball set result plus points for each set, e.g. 3–1 • 25–21, 25–23, 20–25, 25–18."""
-    if game.get("sport") != "🏐 Women's Volleyball":
-        return ""
-    away_sets = game.get("away_score", "—")
-    home_sets = game.get("home_score", "—")
-    away_points = game.get("away_points_by_set") or []
-    home_points = game.get("home_points_by_set") or []
-    pairs = [f"{a}–{h}" for a, h in zip(away_points, home_points)]
-    return f"{away_sets}–{home_sets}" + (f" • " + ", ".join(pairs) if pairs else "")
 
 
 def _volleyball_live_tracker(game):
@@ -1659,7 +1688,7 @@ def render_game(game, favorite=False, close=False, rankings=None, records=None, 
       <div class="meta">{game['sport']} • {meta}{matchup_meta}</div>
       <div class="team">{away_logo}{away_label}{game['away']} ✈️<span class="score">{away_score}</span></div>
       <div class="team">{home_logo}{home_label}{game['home']} 🏠<span class="score">{home_score}</span></div>
-      {f'{_volleyball_live_tracker(game)}<div class="meta">Previous set points: {_volleyball_set_score_text(game).split(" • ", 1)[1] if " • " in _volleyball_set_score_text(game) else "—"}</div>' if game.get("sport") == "🏐 Women's Volleyball" and (game.get("away_points_by_set") or game.get("home_points_by_set")) else ''}
+      {_volleyball_live_tracker(game) if game.get("sport") == "🏐 Women's Volleyball" else ''}
       <div class="meta">Score difference: {game['diff']}{' set' if game.get('sport') == "🏐 Women's Volleyball" and game['diff'] == 1 else (' sets' if game.get('sport') == "🏐 Women's Volleyball" else '')}{change_html}{clock}{start_meta}</div>
     </div>
     """, unsafe_allow_html=True)
