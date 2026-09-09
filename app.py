@@ -263,8 +263,45 @@ def parse_games(data, timezone_name):
     return games
 
 
+def _normalize_team_name(name):
+    return " ".join(str(name or "").lower().replace("&", "and").replace(".", "").split())
+
+
+# NCAA team IDs are different from ESPN team IDs, so favorite matching is
+# primarily name-based now. The stored IDs remain as a fallback for any feed
+# that happens to use the old IDs.
+FAVORITE_NAME_ALIASES = {
+    "Kentucky": {"kentucky", "kentucky wildcats"},
+    "Auburn": {"auburn", "auburn tigers"},
+    "West Florida": {"west florida", "west florida argos", "uwf"},
+    "Alabama": {"alabama", "alabama crimson tide"},
+    "Georgia": {"georgia", "georgia bulldogs"},
+    "Florida": {"florida", "florida gators"},
+    "Florida State": {"florida state", "florida state seminoles"},
+    "Miami": {"miami", "miami hurricanes", "miami (fl)"},
+    "LSU": {"lsu", "lsu tigers", "louisiana state"},
+    "Tennessee": {"tennessee", "tennessee volunteers"},
+    "Clemson": {"clemson", "clemson tigers"},
+    "Ohio State": {"ohio state", "ohio state buckeyes"},
+    "Michigan": {"michigan", "michigan wolverines"},
+    "Notre Dame": {"notre dame", "notre dame fighting irish"},
+}
+
 def is_favorite(game, favorites):
-    return game["home_id"] in favorites.values() or game["away_id"] in favorites.values()
+    home_id = str(game.get("home_id", ""))
+    away_id = str(game.get("away_id", ""))
+    home_name = _normalize_team_name(game.get("home"))
+    away_name = _normalize_team_name(game.get("away"))
+
+    for favorite_name, favorite_id in favorites.items():
+        aliases = {_normalize_team_name(favorite_name)} | {
+            _normalize_team_name(alias) for alias in FAVORITE_NAME_ALIASES.get(favorite_name, set())
+        }
+        if home_id == str(favorite_id) or away_id == str(favorite_id):
+            return True
+        if home_name in aliases or away_name in aliases:
+            return True
+    return False
 
 
 def render_game(game, favorite=False, close=False):
@@ -445,7 +482,7 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold):
     st.subheader("⭐ My Teams")
     if favorite_games:
         for favorite_name, favorite_id in favorites.items():
-            team_games = [g for g in games if g["home_id"] == favorite_id or g["away_id"] == favorite_id]
+            team_games = [g for g in games if is_favorite(g, {favorite_name: favorite_id})]
             st.markdown(f"### ⭐ {favorite_name}")
             if not team_games:
                 st.caption("No games found on today's NCAA scoreboards.")
