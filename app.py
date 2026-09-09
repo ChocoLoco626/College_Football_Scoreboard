@@ -58,6 +58,8 @@ st.markdown("""
 .game-card { border:1px solid rgba(128,128,128,.35); border-radius:14px; padding:15px 18px; margin:8px 0; }
 .score { font-size:30px; font-weight:800; float:right; text-align:right; }
 .set-points { font-size:13px; font-weight:700; opacity:.72; }
+.vb-live-set { margin-top:8px; padding:7px 9px; border:1px solid rgba(49,130,96,.35); border-radius:6px; font-size:13px; font-weight:700; }
+.vb-live-team { margin-left:14px; }
 .team { font-size:18px; font-weight:700; margin:8px 0; min-height:38px; }
 .meta { color:#9ca3af; font-size:13px; }
 .update-bar { border:1px solid rgba(128,128,128,.30); border-radius:12px; padding:9px 12px; margin:8px 0 14px; font-size:13px; }
@@ -451,16 +453,34 @@ def get_volleyball_set_info(game_id, away_id="", home_id=""):
             continue
         away_points = [r["Away"] for r in rows]
         home_points = [r["Home"] for r in rows]
-        # Only count completed/scored sets. A partially populated set is ignored
-        # unless both sides have a numeric point total.
-        away_sets = sum(1 for a, h in zip(away_points, home_points) if a > h)
-        home_sets = sum(1 for a, h in zip(away_points, home_points) if h > a)
+
+        # Treat the final populated row as the live set when it has not yet
+        # reached a legal volleyball set-ending score. This keeps the main
+        # score set-based while exposing the current point-by-point set score.
+        def set_complete(a, h, set_number):
+            target = 15 if set_number >= 5 else 25
+            return max(a, h) >= target and abs(a - h) >= 2
+
+        completed_rows = []
+        current_set = None
+        for idx, row in enumerate(rows, start=1):
+            a, h = row["Away"], row["Home"]
+            if set_complete(a, h, idx):
+                completed_rows.append(row)
+            elif idx == len(rows):
+                current_set = row
+
+        away_sets = sum(1 for row in completed_rows if row["Away"] > row["Home"])
+        home_sets = sum(1 for row in completed_rows if row["Home"] > row["Away"])
         return {
             "rows": rows,
             "away_sets": away_sets,
             "home_sets": home_sets,
             "away_points": away_points,
             "home_points": home_points,
+            "current_set_number": len(completed_rows) + 1 if current_set else None,
+            "current_set_away": current_set["Away"] if current_set else None,
+            "current_set_home": current_set["Home"] if current_set else None,
         }
     return None
 
@@ -477,14 +497,28 @@ def _volleyball_set_score_text(game):
     return f"{away_sets}–{home_sets}" + (f" • " + ", ".join(pairs) if pairs else "")
 
 
+def _volleyball_live_tracker(game):
+    """Return a clear current-set tracker with each team's live point total."""
+    if game.get("sport") != "🏐 Women's Volleyball" or game.get("state") != "in":
+        return ""
+    set_no = game.get("volleyball_current_set")
+    away = game.get("volleyball_current_away")
+    home = game.get("volleyball_current_home")
+    if set_no is None or away is None or home is None:
+        return ""
+    return (
+        f'<div class="vb-live-set">🟢 <strong>LIVE — SET {set_no}</strong>'
+        f'<span class="vb-live-team">{game["away"]}: <strong>{away}</strong></span>'
+        f'<span class="vb-live-team">{game["home"]}: <strong>{home}</strong></span></div>'
+    )
+
+
 def _volleyball_score_label(game, side):
-    """Format volleyball as sets first, then the points won in each set."""
+    """For volleyball, show only sets won in the main score; current points are tracked separately."""
     sets = game.get(f"{side}_score")
-    points = game.get(f"{side}_points_by_set") or []
-    if game.get("sport") != "🏐 Women's Volleyball" or not points:
+    if game.get("sport") != "🏐 Women's Volleyball":
         return str(sets) if sets not in (None, "") else "—"
-    point_text = ", ".join(str(p) for p in points)
-    return f'{sets} <span class="set-points">({point_text})</span>'
+    return str(sets) if sets not in (None, "") else "—"
 
 def _ncaa_football_week(target_date):
     """Return the NCAA football scoreboard week containing target_date.
@@ -1303,6 +1337,9 @@ def parse_games(data, timezone_name):
                 game["away_points_by_set"] = info["away_points"]
                 game["home_points_by_set"] = info["home_points"]
                 game["volleyball_set_scores"] = info["rows"]
+                game["volleyball_current_set"] = info.get("current_set_number")
+                game["volleyball_current_away"] = info.get("current_set_away")
+                game["volleyball_current_home"] = info.get("current_set_home")
                 game["diff"] = abs(info["away_sets"] - info["home_sets"])
 
     return games
@@ -1590,7 +1627,7 @@ def render_game(game, favorite=False, close=False, rankings=None, records=None, 
       <div class="meta">{game['sport']} • {meta}{matchup_meta}</div>
       <div class="team">{away_logo}{away_label}{game['away']} ✈️<span class="score">{away_score}</span></div>
       <div class="team">{home_logo}{home_label}{game['home']} 🏠<span class="score">{home_score}</span></div>
-      {f'<div class="meta">🏐 Set score: {_volleyball_set_score_text(game)}</div>' if game.get("sport") == "🏐 Women's Volleyball" and (game.get("away_points_by_set") or game.get("home_points_by_set")) else ''}
+      {f'{_volleyball_live_tracker(game)}<div class="meta">Previous set points: {_volleyball_set_score_text(game).split(" • ", 1)[1] if " • " in _volleyball_set_score_text(game) else "—"}</div>' if game.get("sport") == "🏐 Women's Volleyball" and (game.get("away_points_by_set") or game.get("home_points_by_set")) else ''}
       <div class="meta">Score difference: {game['diff']}{' set' if game.get('sport') == "🏐 Women's Volleyball" and game['diff'] == 1 else (' sets' if game.get('sport') == "🏐 Women's Volleyball" else '')}{change_html}{clock}{start_meta}</div>
     </div>
     """, unsafe_allow_html=True)
@@ -2068,7 +2105,12 @@ with st.sidebar:
     )
     date_offset = (selected_game_date - today_local).days
 
-    sport_filter = st.multiselect("Sports", list(SPORTS.keys()), default=[], help="Select a sport to load its scores. Leaving this empty makes no NCAA score requests, which keeps the dashboard fast.")
+    st.markdown("**🏅 Sports**")
+    st.caption("Select one or more sports to load. Leaving all unchecked makes no NCAA score requests.")
+    sport_filter = []
+    for _sport_name in SPORTS.keys():
+        if st.checkbox(_sport_name, value=False, key=f"sport_select_{_sport_name}"):
+            sport_filter.append(_sport_name)
     conference_options = ["ACC","AAC","America East","Atlantic 10","ASUN","Big 12","Big East","Big Sky","Big South","Big Ten","Big West","CAA","C-USA","Horizon League","Ivy League","MAAC","MAC","MEAC","Missouri Valley","Mountain West","NEC","Ohio Valley","Pac-12","Patriot League","SEC","SoCon","Southland","Summit League","Sun Belt","SWAC","WAC","WCC","West Coast","Independent"]
     conference_filter = st.multiselect("🏟️ Conferences", conference_options, default=[])
     top25_only = st.checkbox("🏆 Top 25 teams only", value=False)
