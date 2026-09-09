@@ -50,21 +50,72 @@ def today_in_timezone(timezone_name):
     return datetime.now(ZoneInfo(timezone_name)).date()
 
 
-def _ncaa_logo_url(team_names):
-    """Build the NCAA API logo URL from the team's NCAA SEO slug."""
-    if not isinstance(team_names, dict):
-        return ""
-    slug = team_names.get("seo") or team_names.get("team_seo") or team_names.get("slug")
-    if not slug:
-        return ""
-    return f"https://ncaa-api.henrygd.me/logo/{slug}.svg?dark=true"
+def _normalize_team_name(name):
+    return " ".join(str(name or "").lower().replace("&", "and").replace(".", "").split())
+
+
+@st.cache_data(ttl=86400)
+def get_ncaa_schools_index():
+    """Return a flexible name -> NCAA school slug index for reliable logos."""
+    url = "https://ncaa-api.henrygd.me/schools-index"
+    response = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+    response.raise_for_status()
+    payload = response.json()
+    if isinstance(payload, dict):
+        for key in ("schools", "data", "items"):
+            if isinstance(payload.get(key), list):
+                payload = payload[key]
+                break
+    if not isinstance(payload, list):
+        return {}
+    index = {}
+    for school in payload:
+        if not isinstance(school, dict):
+            continue
+        slug = school.get("slug") or school.get("team_seo") or school.get("seo")
+        if not slug:
+            continue
+        names = [
+            school.get("name"), school.get("school"), school.get("school_name"),
+            school.get("short_name"), school.get("team_name"), school.get("displayName"),
+            school.get("team_seo"), school.get("slug"),
+        ]
+        nested = school.get("names")
+        if isinstance(nested, dict):
+            names.extend(nested.get(k) for k in ("full", "short", "seo"))
+        for name in names:
+            key = _normalize_team_name(name)
+            if key:
+                index[key] = str(slug)
+    return index
+
+
+def _ncaa_logo_url(team_names, team=None, school_index=None):
+    """Build a reliable NCAA logo URL, using the scoreboard slug then schools index."""
+    team = team if isinstance(team, dict) else {}
+    team_names = team_names if isinstance(team_names, dict) else {}
+    direct_slug = (team_names.get("seo") or team_names.get("team_seo") or
+                   team_names.get("slug") or team.get("team_seo") or
+                   team.get("seo") or team.get("slug"))
+    slug = direct_slug
+    if school_index:
+        candidates = [
+            team_names.get("full"), team_names.get("short"), team.get("name"),
+            team.get("displayName"), team_names.get("seo"),
+        ]
+        for candidate in candidates:
+            found = school_index.get(_normalize_team_name(candidate))
+            if found:
+                slug = found
+                break
+    return f"https://ncaa-api.henrygd.me/logo/{slug}.svg" if slug else ""
 
 
 RANKING_CONFIGS = {
     "🏈 Football (AP Top 25)": ("football", "fbs", "associated-press"),
     "🏀 Men's Basketball (AP Top 25)": ("basketball-men", "d1", "associated-press"),
     "🏀 Women's Basketball (AP Top 25)": ("basketball-women", "d1", "associated-press"),
-    "🏐 Women's Volleyball (AVCA)": ("volleyball-women", "d1", "avca-coaches"),
+    "🏐 Women's Volleyball (AVCA)": ("volleyball-women", "d1", "avca-rankings"),
 }
 
 
@@ -77,16 +128,19 @@ def get_ncaa_rankings(sport_slug, division, poll_slug):
 
 
 def _extract_ranking_rows(payload):
-    """Normalize several NCAA ranking response shapes into simple table rows."""
+    """Normalize NCAA ranking tables, including the current uppercase column names."""
     if not payload:
         return []
-
     candidates = []
     if isinstance(payload, dict):
-        for key in ("rankings", "data", "teams", "rows", "items"):
-            value = payload.get(key)
-            if isinstance(value, list):
-                candidates.extend(value)
+        value = payload.get("data")
+        if isinstance(value, list):
+            candidates = value
+        else:
+            for key in ("rankings", "teams", "rows", "items"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    candidates.extend(value)
     elif isinstance(payload, list):
         candidates = payload
 
@@ -95,38 +149,21 @@ def _extract_ranking_rows(payload):
         if not isinstance(item, dict):
             continue
         team = item.get("team") if isinstance(item.get("team"), dict) else {}
-        name = (item.get("teamName") or item.get("name") or item.get("school") or
-                team.get("name") or team.get("fullName") or team.get("displayName"))
-        rank = item.get("rank") or item.get("ranking") or item.get("position")
-        record = item.get("record") or item.get("overallRecord") or item.get("winsLosses")
-        points = item.get("points") or item.get("votes") or item.get("totalPoints")
-        previous = item.get("previousRank") or item.get("lastWeek") or item.get("previous")
+        def pick(*keys):
+            for key in keys:
+                if key in item and item[key] not in (None, ""):
+                    return item[key]
+                upper = str(key).upper()
+                if upper in item and item[upper] not in (None, ""):
+                    return item[upper]
+        name = pick("teamName", "school", "name") or team.get("name") or team.get("fullName") or team.get("displayName")
+        rank = pick("rank", "ranking", "position")
+        record = pick("record", "overallRecord", "winsLosses")
+        points = pick("points", "votes", "totalPoints")
+        previous = pick("previousRank", "lastWeek", "previous", "previous ranking")
         if name is not None and rank is not None:
-            rows.append({
-                "Rank": rank,
-                "Team": name,
-                "Record": record or "",
-                "Points/Votes": points or "",
-                "Previous": previous or "",
-            })
+            rows.append({"Rank": rank, "Team": name, "Record": record or "", "Points/Votes": points or "", "Previous": previous or ""})
 
-    # Some NCAA responses nest the ranking rows more deeply.
-    if not rows:
-        for obj in _walk_json(payload):
-            if not isinstance(obj, dict):
-                continue
-            rank = obj.get("rank") or obj.get("ranking") or obj.get("position")
-            name = obj.get("teamName") or obj.get("school") or obj.get("name")
-            if rank is not None and name is not None:
-                rows.append({
-                    "Rank": rank,
-                    "Team": name,
-                    "Record": obj.get("record") or obj.get("overallRecord") or "",
-                    "Points/Votes": obj.get("points") or obj.get("votes") or "",
-                    "Previous": obj.get("previousRank") or obj.get("lastWeek") or "",
-                })
-
-    # De-duplicate rows while preserving order.
     seen = set()
     unique = []
     for row in rows:
@@ -278,6 +315,10 @@ def get_ncaa_scoreboard(sport_slug, division, sport_name, timezone_name):
 
     raw_games = payload.get("games", []) if isinstance(payload, dict) else []
     events = []
+    try:
+        school_index = get_ncaa_schools_index()
+    except Exception:
+        school_index = {}
 
     for item in raw_games:
         game = item.get("game", item) if isinstance(item, dict) else {}
@@ -291,8 +332,8 @@ def get_ncaa_scoreboard(sport_slug, division, sport_name, timezone_name):
 
         away_name = away_names.get("full") or away_names.get("short") or away.get("name") or "Away"
         home_name = home_names.get("full") or home_names.get("short") or home.get("name") or "Home"
-        away_logo = _ncaa_logo_url(away_names)
-        home_logo = _ncaa_logo_url(home_names)
+        away_logo = _ncaa_logo_url(away_names, away, school_index)
+        home_logo = _ncaa_logo_url(home_names, home, school_index)
         game_id = str(game.get("gameID") or game.get("gameId") or f"ncaa-{away_name}-{home_name}")
 
         # Prefer NCAA's epoch timestamp; otherwise combine startDate + startTime.
@@ -358,6 +399,7 @@ def get_ncaa_scoreboard(sport_slug, division, sport_name, timezone_name):
                     {"homeAway": "home", "team": {"id": str(home.get("id", "")), "displayName": home_name, "logo": home_logo}, "score": str(home_score)},
                 ],
                 "broadcasts": ([{"names": [game.get("network")]}] if game.get("network") else []),
+                "_venue": game.get("venue") or game.get("venueName") or game.get("location") or "",
             }],
             "_sport_name": sport_name,
             "_sport": sport_slug,
@@ -471,6 +513,7 @@ def parse_games(data, timezone_name):
             "clock": status.get("displayClock", ""),
             "period": status.get("period", ""),
             "broadcasts": [n for b in competition.get("broadcasts", []) for n in b.get("names", [])],
+            "venue": event.get("_venue", ""),
         })
     return games
 
@@ -516,6 +559,52 @@ def is_favorite(game, favorites):
     return False
 
 
+
+def _collect_watch_info(payload):
+    """Best-effort extraction of network/broadcast and venue from NCAA game-center data."""
+    if not payload:
+        return {"broadcasts": [], "venue": ""}
+    broadcasts, venues = [], []
+    broadcast_keys = {"network", "networkname", "broadcast", "broadcastname", "tv", "channel", "watch", "stream"}
+    venue_keys = {"venue", "venuename", "stadium", "arenaname", "location"}
+    def walk(value):
+        if isinstance(value, dict):
+            for k, v in value.items():
+                nk = str(k).lower().replace("_", "").replace("-", "")
+                if nk in broadcast_keys:
+                    vals = v if isinstance(v, list) else [v]
+                    for x in vals:
+                        if isinstance(x, dict):
+                            x = x.get("name") or x.get("title") or x.get("displayName") or x.get("network")
+                        if isinstance(x, str) and x.strip():
+                            broadcasts.append(x.strip())
+                if nk in venue_keys:
+                    if isinstance(v, dict):
+                        v = v.get("name") or v.get("displayName") or v.get("fullName")
+                    if isinstance(v, str) and v.strip():
+                        venues.append(v.strip())
+                walk(v)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+    walk(payload)
+    def unique(values):
+        out=[]; seen=set()
+        for value in values:
+            if value.lower() not in seen:
+                seen.add(value.lower()); out.append(value)
+        return out
+    return {"broadcasts": unique(broadcasts)[:6], "venue": unique(venues)[:1][0] if venues else ""}
+
+
+@st.cache_data(ttl=30)
+def get_game_watch_info(game_id):
+    if not game_id or str(game_id).startswith("ncaa-"):
+        return {"broadcasts": [], "venue": ""}
+    detail = get_ncaa_game_detail(game_id)
+    return _collect_watch_info(detail)
+
+
 def render_game(game, favorite=False, close=False):
     status_badge = "🔴 LIVE" if game["state"] == "in" else ("FINAL" if game["state"] == "post" else "UPCOMING")
     meta = " • ".join(x for x in [
@@ -551,6 +640,34 @@ def render_game(game, favorite=False, close=False):
       <div class="meta">Score difference: {game['diff']}{clock}{(' • Start: ' + start_time) if start_time else ''}</div>
     </div>
     """, unsafe_allow_html=True)
+
+    if game.get("state") in ("pre", "in", "post"):
+        watch_key = f"watch_info_{game['id']}"
+        if watch_key not in st.session_state:
+            st.session_state[watch_key] = None
+        if game.get("broadcasts") or game.get("venue"):
+            parts = []
+            if game.get("broadcasts"):
+                parts.append("📺 " + ", ".join(game["broadcasts"]))
+            if game.get("venue"):
+                parts.append("📍 " + game["venue"])
+            st.caption(" • ".join(parts))
+        if st.button("📺 Where to watch", key=f"watch_btn_{game['id']}"):
+            try:
+                st.session_state[watch_key] = get_game_watch_info(game["id"])
+            except Exception as exc:
+                st.session_state[watch_key] = {"error": f"Could not retrieve game information: {type(exc).__name__}: {exc}"}
+        info = st.session_state.get(watch_key)
+        if info is not None:
+            if info.get("error"):
+                st.warning(info["error"])
+            else:
+                parts = []
+                if info.get("broadcasts"):
+                    parts.append("📺 Watch: " + ", ".join(info["broadcasts"]))
+                if info.get("venue"):
+                    parts.append("📍 Venue: " + info["venue"])
+                st.info(" • ".join(parts) if parts else "The NCAA game feed does not list a broadcast or venue for this game yet.")
 
     if game.get("sport") == "🏐 Women's Volleyball" and game.get("state") in ("in", "post"):
         key = f"volley_sets_{game['id']}"
@@ -744,6 +861,7 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold):
 
     st.markdown("---")
     st.subheader("🏅 Rankings")
+    st.caption("Current NCAA poll data. Football and basketball use AP; volleyball uses the AVCA poll.")
     ranking_choice = st.selectbox(
         "Ranking",
         list(RANKING_CONFIGS.keys()),

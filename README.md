@@ -1,30 +1,15 @@
-# College Sports Live Scoreboard
+# NCAA College Sports Live Scoreboard
 
-A Streamlit college-sports scoreboard powered by the NCAA scoreboard API.
+Streamlit college sports scoreboard using the NCAA API.
 
-## Included
-
-- Football: FBS + FCS
-- Men's and women's soccer
-- Men's and women's basketball
-- Women's volleyball
-- Baseball and softball
-- Eastern Time / Central Time selector
-- NCAA team logos
-- My Teams dashboard
-- Favorite-team highlighting
-- Live status and game clock/period when supplied by NCAA
-- TV/broadcast information when supplied by NCAA
-- All games sorted by score closeness, with live games first
-- Close-game threshold
-- Automatic 30-second refresh
-- Diagnostics panel for checking NCAA source data
-- Volleyball set-by-set scores on demand for live/final matches when the NCAA game feed provides them
-
-## Streamlit Community Cloud
-
-1. Put this project in a GitHub repository.
-2. Create a Streamlit app using `app.py` as the main file.
-3. Deploy using the included `requirements.txt`.
-
-The app uses the public `ncaa-api.henrygd.me` service. Its public API is rate-limited, so volleyball set details are fetched only when you press the set-score button rather than for every game automatically.
+Features:
+- NCAA scores for football, men's/women's soccer, men's/women's basketball, women's volleyball, baseball, softball
+- Eastern/Central time zones
+- Favorites / My Teams
+- Live games sorted by score closeness
+- Upcoming games at the bottom sorted by start time
+- NCAA school logos with schools-index fallback
+- NCAA AP/AVCA rankings
+- On-demand volleyball set scores
+- On-demand "Where to watch" / venue information from NCAA game details
+- Diagnostics and 30-second refresh
