@@ -517,6 +517,21 @@ def get_ncaa_scoreboard(sport_slug, division, sport_name, timezone_name, target_
                     except ValueError:
                         pass
 
+        # NCAA's football/legacy feeds can expose an epoch whose UTC/local
+        # calendar date is one day away from the feed's startDate.  The
+        # scoreboard request is already scoped to a calendar date, so when
+        # startDate is present and differs by exactly one day, preserve the
+        # feed's calendar date while keeping the actual clock/timezone. This
+        # prevents late-night games from appearing on the previous/next day.
+        source_start_date = game.get("startDate")
+        if event_dt is not None and isinstance(source_start_date, str):
+            try:
+                source_day = date.fromisoformat(source_start_date[:10])
+                if abs((event_dt.date() - source_day).days) == 1:
+                    event_dt = event_dt.replace(year=source_day.year, month=source_day.month, day=source_day.day)
+            except ValueError:
+                pass
+
         state_raw = str(game.get("gameState", game.get("status", "P"))).upper()
         state = "in" if state_raw in ("I", "LIVE", "IN") else ("post" if state_raw in ("F", "FINAL", "POST") else "pre")
 

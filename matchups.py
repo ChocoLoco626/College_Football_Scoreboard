@@ -43,7 +43,7 @@ TEAM_ALIASES = {
     "lsu": ["lsu", "louisiana state", "lsu tigers"],
     "maryland": ["maryland", "maryland terrapins"],
     "miami": ["miami", "miami hurricanes", "miami (fl)"],
-    "michigan": ["michigan", "michigan wolverines"],
+    "michigan": ["michigan", "michigan wolverines", "michigan wolverines"],
     "michigan state": ["michigan state", "michigan state spartans"],
     "minnesota": ["minnesota", "minnesota golden gophers"],
     "mississippi": ["mississippi", "ole miss", "ole miss rebels"],
@@ -55,7 +55,7 @@ TEAM_ALIASES = {
     "north carolina state": ["north carolina state", "nc state", "nc state wolfpack"],
     "northwestern": ["northwestern", "northwestern wildcats"],
     "notre dame": ["notre dame", "notre dame fighting irish"],
-    "ohio state": ["ohio state", "ohio state buckeyes"],
+    "ohio state": ["ohio state", "ohio state buckeyes", "ohio st", "ohio st buckeyes", "ohio st."],
     "oklahoma": ["oklahoma", "oklahoma sooners"],
     "oklahoma state": ["oklahoma state", "oklahoma state cowboys"],
     "oregon": ["oregon", "oregon ducks"],
@@ -128,6 +128,17 @@ def team_key(name):
     n = _norm(name)
     if n in TEAM_KEY_BY_ALIAS:
         return TEAM_KEY_BY_ALIAS[n]
+    # Common NCAA abbreviations/punctuation variants.
+    short_aliases = {
+        "ohio st": "ohio state",
+        "ohio st buckeyes": "ohio state",
+        "michigan": "michigan",
+        "michigan wolverines": "michigan",
+        "kentucky wildcats": "kentucky",
+        "louisville cardinals": "louisville",
+    }
+    if n in short_aliases:
+        return short_aliases[n]
     # NCAA often appends a mascot to an otherwise exact school name.
     for alias, key in sorted(TEAM_KEY_BY_ALIAS.items(), key=lambda x: len(x[0]), reverse=True):
         if n.startswith(alias + " ") or n.endswith(" " + alias):
