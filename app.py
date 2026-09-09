@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 import base64
 import requests
@@ -528,22 +528,44 @@ NCAA_SPORTS = {
 
 @st.cache_data(ttl=20)
 def get_all_scoreboards(timezone_name, target_date=None):
+    """Fetch NCAA scoreboards for a selected local calendar date.
+
+    NCAA's football feed can occasionally place a late-evening ET game on the
+    following UTC calendar date. For football only, we also inspect the next
+    NCAA calendar date so the game still appears on the correct local date.
+    """
     combined = []
     errors = []
     diagnostics = []
+    target_date = target_date or today_in_timezone(timezone_name)
+
     for sport_name, configs in NCAA_SPORTS.items():
         for sport_slug, division in configs:
-            try:
-                data = get_ncaa_scoreboard(sport_slug, division, sport_name, timezone_name, target_date)
-                if data.get("_diagnostic"):
-                    diagnostics.append({"sport": sport_name, **data["_diagnostic"]})
-                for event in data.get("events", []):
-                    event["_sport_name"] = sport_name
-                    combined.append(event)
-            except requests.RequestException as exc:
-                errors.append(f"{sport_name} ({sport_slug}/{division}): {exc}")
-            except Exception as exc:
-                errors.append(f"{sport_name} ({sport_slug}/{division}): {type(exc).__name__}: {exc}")
+            dates_to_fetch = [target_date]
+            if sport_slug == "football":
+                dates_to_fetch.append(target_date + timedelta(days=1))
+            seen_ids = set()
+            for fetch_date in dates_to_fetch:
+                try:
+                    data = get_ncaa_scoreboard(sport_slug, division, sport_name, timezone_name, fetch_date)
+                    if data.get("_diagnostic"):
+                        diagnostics.append({
+                            "sport": sport_name,
+                            "requested_date": str(fetch_date),
+                            **data["_diagnostic"],
+                        })
+                    for event in data.get("events", []):
+                        event["_sport_name"] = sport_name
+                        event_id = str(event.get("id", ""))
+                        if event_id and event_id in seen_ids:
+                            continue
+                        if event_id:
+                            seen_ids.add(event_id)
+                        combined.append(event)
+                except requests.RequestException as exc:
+                    errors.append(f"{sport_name} ({sport_slug}/{division}, {fetch_date}): {exc}")
+                except Exception as exc:
+                    errors.append(f"{sport_name} ({sport_slug}/{division}, {fetch_date}): {type(exc).__name__}: {exc}")
     return {"events": combined, "errors": errors, "diagnostics": diagnostics}
 
 
@@ -1010,7 +1032,14 @@ def render_conference_standings(selected_sport, selected_conference=""):
 def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, conference_filter, top25_only, date_offset, live_only, favorites_only, standings_sport, standings_conference):
     st.title("🏆 College Sports Live")
     selected_date = today_in_timezone(selected_timezone) + timedelta(days=date_offset)
-    date_label = { -1: "Yesterday", 0: "Today", 1: "Tomorrow" }.get(date_offset, str(selected_date))
+    if date_offset == 0:
+        date_label = "Today"
+    elif date_offset == 1:
+        date_label = "Tomorrow"
+    elif date_offset == -1:
+        date_label = "Yesterday"
+    else:
+        date_label = selected_date.strftime("%A, %B %-d, %Y") if hasattr(selected_date, "strftime") else str(selected_date)
     st.caption(f"NCAA college scores • {date_label} • Showing times in {timezone_label}")
 
     try:
@@ -1112,8 +1141,16 @@ with st.sidebar:
     timezone_label = st.selectbox("Time zone", list(TIMEZONES.keys()), index=list(TIMEZONES.keys()).index(DEFAULT_TIMEZONE))
     selected_timezone = TIMEZONES[timezone_label]
 
-    date_choice = st.radio("📅 Date", ["Yesterday", "Today", "Tomorrow"], index=1)
-    date_offset = {"Yesterday": -1, "Today": 0, "Tomorrow": 1}[date_choice]
+    st.subheader("📅 Game Date")
+    today_local = today_in_timezone(selected_timezone)
+    selected_game_date = st.date_input(
+        "Search any date",
+        value=today_local,
+        min_value=date(2000, 1, 1),
+        max_value=date(2035, 12, 31),
+        help="Choose any calendar date to load NCAA games for that day.",
+    )
+    date_offset = (selected_game_date - today_local).days
 
     sport_filter = st.multiselect("Sports", list(SPORTS.keys()), default=list(SPORTS.keys()))
     conference_options = ["ACC","AAC","America East","Atlantic 10","ASUN","Big 12","Big East","Big Sky","Big South","Big Ten","Big West","CAA","C-USA","Horizon League","Ivy League","MAAC","MAC","MEAC","Missouri Valley","Mountain West","NEC","Ohio Valley","Pac-12","Patriot League","SEC","SoCon","Southland","Summit League","Sun Belt","SWAC","WAC","WCC","West Coast","Independent"]
