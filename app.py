@@ -63,7 +63,7 @@ def get_scoreboard(sport, league, group=None, timezone_name=TIMEZONES[DEFAULT_TI
     rather than volleyball having special-case behavior.
     """
     url = f"{ESPN_BASE}/{sport}/{league}/scoreboard"
-    today = today_in_timezone(timezone_name)
+    today = today_in_timezone(selected_timezone)
     tomorrow = today + timedelta(days=1)
     today_str = today.strftime("%Y%m%d")
     window_str = f"{today_str}-{tomorrow.strftime('%Y%m%d')}"
@@ -221,7 +221,7 @@ with st.sidebar:
 
 
 @st.fragment(run_every=30)
-def live_dashboard():
+def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold):
     st.title("🏆 College Sports Live")
     st.caption(f"ESPN college scores • Showing times in {timezone_label}")
 
@@ -238,7 +238,7 @@ def live_dashboard():
 
     # Only show games whose event timestamp lands on today's ESPN/U.S. Eastern
     # calendar date. Tomorrow is fetched only as a reliability fallback.
-    today = today_in_timezone(timezone_name)
+    today = today_in_timezone(selected_timezone)
     games = [g for g in games if g.get("event_date") == today]
 
     favorites = st.session_state.favorites
@@ -299,4 +299,4 @@ def live_dashboard():
             render_game(game, favorite=is_favorite(game, favorites), close=(game["state"] == "in" and game["diff"] < threshold))
 
 
-live_dashboard()
+live_dashboard(timezone_label, selected_timezone, sport_filter, threshold)
