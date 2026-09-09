@@ -71,11 +71,6 @@ st.markdown("""
 .myteam-score { font-size:22px; font-weight:850; line-height:1.1; }
 .myteam-opponent { font-size:13px; margin-top:4px; }
 .history-row { border-bottom:1px solid rgba(128,128,128,.18); padding:7px 0; font-size:13px; }
-.watch-card { border:1px solid rgba(128,128,128,.35); border-radius:14px; padding:12px 15px; margin:7px 0; }
-.watch-title { font-size:17px; font-weight:850; }
-.watch-score { font-size:24px; font-weight:850; margin-top:4px; }
-.watch-meta { color:#9ca3af; font-size:12px; margin-top:3px; }
-.watch-reasons { font-size:12px; font-weight:700; margin-top:6px; line-height:1.45; }
 .history-time { color:#9ca3af; font-size:11px; }
 .score-change { font-size:12px; font-weight:800; margin-left:8px; }
 .countdown { font-weight:800; }
@@ -1430,130 +1425,6 @@ def _late_close_reason(game, close_thresholds):
     return False
 
 
-def _games_to_watch(game, rankings, favorites, close_thresholds):
-    """Score a game using local NCAA data already loaded for the scoreboard.
-
-    This intentionally avoids a second external service: the 'Games to Watch'
-    score is an API-backed intelligence layer built from the NCAA scoreboard,
-    rankings, favorite teams, and matchup metadata already in this app.
-    """
-    if game.get("state") == "post":
-        return None
-
-    score = 0
-    reasons = []
-    ranked_count, ranked_labels = _is_ranked_game(game, rankings)
-    if ranked_count == 2:
-        score += 7
-        reasons.append("🏆 Ranked vs. Ranked")
-    elif ranked_count == 1:
-        score += 3
-        reasons.append("🏆 Ranked Team")
-
-    badges = format_matchup_badges(game)
-    badge_text = " ".join(badges).lower()
-    if "rivalry" in badge_text:
-        score += 7
-        rivalry = next((b for b in badges if "RIVALRY" in b), "🔥 Rivalry")
-        reasons.append(rivalry.replace("🔥 ", ""))
-    if "postseason" in badge_text or "tournament" in badge_text or "championship" in badge_text:
-        score += 5
-        postseason = next((b for b in badges if any(x in b.upper() for x in ("TOURNAMENT", "POSTSEASON", "CHAMPIONSHIP"))), "🏆 Postseason")
-        reasons.append(postseason.replace("🏆 ", ""))
-    if "conference" in badge_text:
-        score += 2
-        reasons.append("🏟️ Conference matchup")
-
-    if is_favorite(game, favorites):
-        score += 5
-        reasons.append("⭐ My Team")
-
-    close_limit = int(close_thresholds.get(game.get("sport"), 7))
-    is_close = int(game.get("diff", 999)) <= close_limit and game.get("state") == "in"
-    if is_close:
-        score += 6
-        reasons.append("🔥 Close game")
-
-    late_close = _late_close_reason(game, close_thresholds)
-    if late_close:
-        score += 8
-        reasons.append("🚨 Close late")
-
-    if game.get("state") == "pre":
-        countdown = _upcoming_countdown(game.get("event_time"))
-        if countdown:
-            try:
-                event_time = game.get("event_time")
-                minutes = int((event_time - datetime.now(event_time.tzinfo)).total_seconds() // 60)
-                if 0 <= minutes <= 60:
-                    score += 3
-                    reasons.append("⏰ Starting soon")
-            except Exception:
-                pass
-
-    if not reasons:
-        return None
-
-    # Live games outrank otherwise equivalent upcoming games; then use the
-    # watch score and smallest score margin as deterministic tie breakers.
-    state_priority = 2 if game.get("state") == "in" else 1
-    return {
-        "score": score,
-        "reasons": reasons,
-        "ranked_labels": ranked_labels,
-        "late_close": late_close,
-        "state_priority": state_priority,
-    }
-
-
-def render_games_to_watch(games, rankings_by_sport, favorites, close_thresholds, records_by_sport, compact_mode=False, limit=8):
-    """Render the top API-backed games-to-watch recommendations."""
-    candidates = []
-    for game in games:
-        info = _games_to_watch(game, rankings_by_sport.get(game.get("sport"), {}), favorites, close_thresholds)
-        if not info:
-            continue
-        item = dict(game)
-        item["watch_info"] = info
-        candidates.append(item)
-
-    candidates.sort(key=lambda g: (
-        -g["watch_info"]["state_priority"],
-        -g["watch_info"]["score"],
-        0 if g.get("state") == "in" else 1,
-        g.get("diff", 999),
-        g.get("event_time") or datetime.max.replace(tzinfo=ZoneInfo("UTC")),
-    ))
-    candidates = candidates[:limit]
-
-    if not candidates:
-        st.info("No games currently meet the Games to Watch criteria.")
-        return
-
-    st.caption("Ranked teams, rivalries, postseason games, conference matchups, favorites, close scores, and late-game drama are weighted automatically from NCAA data.")
-    for i, game in enumerate(candidates):
-        info = game["watch_info"]
-        reason_text = " • ".join(info["reasons"])
-        status = _live_status_text(game) if game.get("state") == "in" else "Starts soon" if game.get("event_time") else "Upcoming"
-        if game.get("state") == "pre" and game.get("event_time"):
-            status = f'{game["event_time"].strftime("%I:%M %p %Z").lstrip("0")} • {_upcoming_countdown(game["event_time"])}'
-        favorite = is_favorite(game, favorites)
-        st.markdown(
-            f'<div class="watch-card">'
-            f'<div class="watch-title">🔥 {game["away"]} at {game["home"]}</div>'
-            f'<div class="watch-score">'
-            f'{_volleyball_score_label(game, "away")} – {_volleyball_score_label(game, "home")}'
-            f'</div>'
-            f'<div class="watch-meta">{game.get("sport", "")} • {status} • Watch score: {info["score"]}</div>'
-            f'<div class="watch-reasons">{reason_text}</div>'
-            f'</div>', unsafe_allow_html=True)
-
-        # Keep the recommendation compact; the full card below still contains
-        # venue, TV, rankings, records, logos, and detailed status when useful.
-        with st.expander(f"View full matchup • {game['away']} at {game['home']}", expanded=False):
-            render_game({**game, "_render_context": "watch"}, favorite=favorite, close=game.get("state") == "in" and game.get("diff", 999) <= int(close_thresholds.get(game.get("sport"), 7)), rankings=rankings_by_sport.get(game.get("sport"), {}), records=records_by_sport.get(game.get("sport"), {}), compact=compact_mode)
-
-
 def render_game(game, favorite=False, close=False, rankings=None, records=None, compact=False):
     status_badge = "🔴 LIVE NOW" if game["state"] == "in" else ("FINAL" if game["state"] == "post" else "UPCOMING")
     live_detail = _live_status_text(game)
@@ -2034,18 +1905,6 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, close_thresh
                     )
     else:
         st.info("Select teams in the sidebar to build your My Teams dashboard.")
-
-    st.markdown("---")
-    st.subheader("🔥 Games to Watch")
-    render_games_to_watch(
-        games,
-        ranking_maps,
-        favorites,
-        close_thresholds,
-        record_maps,
-        compact_mode=compact_mode,
-        limit=8,
-    )
 
     st.markdown("---")
     with st.expander("📈 Score Change History", expanded=False):
