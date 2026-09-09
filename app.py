@@ -47,6 +47,7 @@ st.markdown("""
 .update-good { color:#22c55e; font-weight:700; }
 .update-warn { color:#eab308; font-weight:700; }
 .update-bad { color:#ef4444; font-weight:700; }
+.myteam-game-row { border-top:1px solid rgba(128,128,128,.18); padding-top:8px; margin-top:8px; }
 .myteam-card { border:1px solid rgba(128,128,128,.30); border-radius:12px; padding:11px 13px; margin:5px 0 10px; min-height:112px; }
 .myteam-name { font-size:16px; font-weight:800; margin-bottom:4px; }
 .myteam-status { font-size:12px; color:#9ca3af; margin-bottom:7px; }
@@ -1322,33 +1323,80 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, c
             cols = st.columns(columns_per_row)
             for col, (favorite_name, favorite_id) in zip(cols, row):
                 with col:
+                    # Do not collapse a team's schedule to its first game.  A team
+                    # can play multiple games on the same date (doubleheaders,
+                    # tournaments, rescheduled games, etc.), so show every match.
                     team_games = [g for g in games if is_favorite(g, {favorite_name: favorite_id})]
+                    team_games = sorted(
+                        team_games,
+                        key=lambda g: (
+                            0 if g["state"] == "in" else (1 if g["state"] == "pre" else 2),
+                            g.get("event_time") or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone)),
+                        ),
+                    )
+
+                    # Use the first available record across this team's games.
+                    favorite_record = ""
+                    for tg in team_games:
+                        opponent_is_home = _normalize_team_name(tg["home"]) in {
+                            _normalize_team_name(favorite_name)
+                        } | {
+                            _normalize_team_name(a) for a in FAVORITE_NAME_ALIASES.get(favorite_name, set())
+                        }
+                        if opponent_is_home:
+                            favorite_record = tg.get("home_record") or record_maps.get(tg["sport"], {}).get(_normalize_team_name(tg["home"])) or record_maps.get(tg["sport"], {}).get(f"id:{tg.get('home_id', '')}") or ""
+                        else:
+                            favorite_record = tg.get("away_record") or record_maps.get(tg["sport"], {}).get(_normalize_team_name(tg["away"])) or record_maps.get(tg["sport"], {}).get(f"id:{tg.get('away_id', '')}") or ""
+                        if favorite_record:
+                            break
+
+                    header_record = f" ({favorite_record})" if favorite_record else ""
                     if not team_games:
                         st.markdown(
-                            f'<div class="myteam-card"><div class="myteam-name">⭐ {favorite_name}</div>'
+                            f'<div class="myteam-card"><div class="myteam-name">⭐ {favorite_name}{header_record}</div>'
                             f'<div class="myteam-status">No game on this date</div>'
                             f'<div class="myteam-opponent">—</div></div>', unsafe_allow_html=True)
                         continue
-                    game = sorted(team_games, key=lambda g: (g["state"] != "in", g["event_time"] or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone))))[0]
-                    home = _normalize_team_name(game["home"]) in {_normalize_team_name(favorite_name)} | {_normalize_team_name(a) for a in FAVORITE_NAME_ALIASES.get(favorite_name, set())}
-                    opponent = game["away"] if home else game["home"]
-                    if game["state"] == "in":
-                        status = "🔴 LIVE"
-                        score = f'{game["home_score"]}–{game["away_score"]}'
-                    elif game["state"] == "post":
-                        status = "FINAL"
-                        score = f'{game["home_score"]}–{game["away_score"]}'
-                    else:
-                        status = game.get("event_time").strftime("%I:%M %p").lstrip("0") if game.get("event_time") else "UPCOMING"
-                        score = "—"
-                    alert = bool(st.session_state.get(_alert_key(game["id"]), False))
-                    alert_text = " • 🔔 Alert" if alert else ""
-                    result_text = "vs" if home else "at"
+
+                    game_rows = []
+                    for game in team_games:
+                        home_aliases = {_normalize_team_name(favorite_name)} | {
+                            _normalize_team_name(a) for a in FAVORITE_NAME_ALIASES.get(favorite_name, set())
+                        }
+                        is_home = _normalize_team_name(game["home"]) in home_aliases
+                        opponent = game["away"] if is_home else game["home"]
+                        opponent_record = game.get("away_record") if is_home else game.get("home_record")
+                        opponent_record = opponent_record or record_maps.get(game["sport"], {}).get(_normalize_team_name(opponent)) or record_maps.get(game["sport"], {}).get(f"id:{game.get('away_id' if is_home else 'home_id', '')}") or ""
+                        favorite_game_record = game.get("home_record") if is_home else game.get("away_record")
+                        favorite_game_record = favorite_game_record or favorite_record
+
+                        if game["state"] == "in":
+                            status = "🔴 LIVE"
+                            score = f'{game["home_score"]}–{game["away_score"]}'
+                        elif game["state"] == "post":
+                            status = "FINAL"
+                            score = f'{game["home_score"]}–{game["away_score"]}'
+                        else:
+                            status = game.get("event_time").strftime("%I:%M %p").lstrip("0") if game.get("event_time") else "UPCOMING"
+                            score = "—"
+
+                        alert = bool(st.session_state.get(_alert_key(game["id"]), False))
+                        alert_text = " • 🔔" if alert else ""
+                        result_text = "vs" if is_home else "at"
+                        favorite_team_label = f"{favorite_name}{f' ({favorite_game_record})' if favorite_game_record else ''}"
+                        opponent_label = f"{opponent}{f' ({opponent_record})' if opponent_record else ''}"
+                        game_rows.append(
+                            f'<div class="myteam-game-row">'
+                            f'<div class="myteam-status">{status}{alert_text} • {game["sport"]}</div>'
+                            f'<div class="myteam-score">{score}</div>'
+                            f'<div class="myteam-opponent">{favorite_team_label} {result_text} {opponent_label}</div>'
+                            f'</div>'
+                        )
+
                     st.markdown(
-                        f'<div class="myteam-card"><div class="myteam-name">⭐ {favorite_name}</div>'
-                        f'<div class="myteam-status">{status}{alert_text} • {game["sport"]}</div>'
-                        f'<div class="myteam-score">{score}</div>'
-                        f'<div class="myteam-opponent">{result_text} {opponent}</div></div>',
+                        f'<div class="myteam-card"><div class="myteam-name">⭐ {favorite_name}{header_record}</div>'
+                        + ''.join(game_rows)
+                        + '</div>',
                         unsafe_allow_html=True,
                     )
     else:
