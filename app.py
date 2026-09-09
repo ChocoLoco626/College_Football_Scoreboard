@@ -41,7 +41,6 @@ st.markdown("""
 .game-card { border:1px solid rgba(128,128,128,.35); border-radius:14px; padding:15px 18px; margin:8px 0; }
 .score { font-size:30px; font-weight:800; float:right; }
 .team { font-size:18px; font-weight:700; margin:8px 0; min-height:38px; }
-.rank { font-size:15px; font-weight:800; margin-right:5px; opacity:.85; }
 .meta { color:#9ca3af; font-size:13px; }
 </style>
 """, unsafe_allow_html=True)
@@ -57,29 +56,29 @@ def _normalize_team_name(name):
 
 @st.cache_data(ttl=86400)
 def get_ncaa_schools_index():
-    """Return a flexible name -> NCAA school slug index for reliable logos."""
+    """Return normalized school-name -> official NCAA logo slug mappings."""
     url = "https://ncaa-api.henrygd.me/schools-index"
     response = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
     response.raise_for_status()
     payload = response.json()
     if isinstance(payload, dict):
-        for key in ("schools", "data", "items"):
-            if isinstance(payload.get(key), list):
-                payload = payload[key]
-                break
+        payload = payload.get("schools") or payload.get("data") or payload.get("items") or []
     if not isinstance(payload, list):
         return {}
+
     index = {}
     for school in payload:
         if not isinstance(school, dict):
             continue
+        # ncaa-api currently returns: slug, name, long
         slug = school.get("slug") or school.get("team_seo") or school.get("seo")
         if not slug:
             continue
         names = [
-            school.get("name"), school.get("school"), school.get("school_name"),
-            school.get("short_name"), school.get("team_name"), school.get("displayName"),
-            school.get("team_seo"), school.get("slug"),
+            school.get("name"), school.get("long"), school.get("long_name"),
+            school.get("school"), school.get("school_name"), school.get("short_name"),
+            school.get("team_name"), school.get("displayName"), school.get("team_seo"),
+            school.get("slug"),
         ]
         nested = school.get("names")
         if isinstance(nested, dict):
@@ -91,25 +90,55 @@ def get_ncaa_schools_index():
     return index
 
 
+# Common NCAA naming differences that otherwise prevent a school-index match.
+NCAA_LOGO_ALIASES = {
+    "miami (fl)": "miami-fl",
+    "miami fl": "miami-fl",
+    "miami hurricanes": "miami-fl",
+    "ole miss": "ole-miss",
+    "mississippi": "ole-miss",
+    "uconn": "connecticut",
+    "connecticut huskies": "connecticut",
+    "pitt": "pittsburgh",
+    "pittsburgh panthers": "pittsburgh",
+    "nc state": "north-carolina-state",
+    "north carolina state": "north-carolina-state",
+    "utsa": "utsa",
+    "ucf": "ucf",
+    "uwf": "west-florida",
+}
+
+def _slugify_logo_name(name):
+    import re, unicodedata
+    text = unicodedata.normalize("NFKD", str(name or "")).encode("ascii", "ignore").decode("ascii")
+    text = text.lower().replace("&", " and ")
+    text = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+    return text
+
 def _ncaa_logo_url(team_names, team=None, school_index=None):
-    """Build a reliable NCAA logo URL, using the scoreboard slug then schools index."""
+    """Build an NCAA logo URL using the exact school-index slug, then safe fallbacks."""
     team = team if isinstance(team, dict) else {}
     team_names = team_names if isinstance(team_names, dict) else {}
-    direct_slug = (team_names.get("seo") or team_names.get("team_seo") or
-                   team_names.get("slug") or team.get("team_seo") or
-                   team.get("seo") or team.get("slug"))
-    slug = direct_slug
+    candidates = [
+        team_names.get("seo"), team_names.get("team_seo"), team_names.get("slug"),
+        team.get("team_seo"), team.get("seo"), team.get("slug"),
+        team_names.get("full"), team_names.get("short"), team.get("name"), team.get("displayName"),
+    ]
     if school_index:
-        candidates = [
-            team_names.get("full"), team_names.get("short"), team.get("name"),
-            team.get("displayName"), team_names.get("seo"),
-        ]
         for candidate in candidates:
-            found = school_index.get(_normalize_team_name(candidate))
-            if found:
-                slug = found
-                break
-    return f"https://ncaa-api.henrygd.me/logo/{slug}.svg" if slug else ""
+            key = _normalize_team_name(candidate)
+            if key in school_index:
+                return f"https://ncaa-api.henrygd.me/logo/{school_index[key]}.svg?dark=true"
+            alias = NCAA_LOGO_ALIASES.get(key)
+            if alias:
+                return f"https://ncaa-api.henrygd.me/logo/{alias}.svg?dark=true"
+    for candidate in candidates:
+        if candidate:
+            alias = NCAA_LOGO_ALIASES.get(_normalize_team_name(candidate))
+            slug = alias or _slugify_logo_name(candidate)
+            if slug:
+                return f"https://ncaa-api.henrygd.me/logo/{slug}.svg?dark=true"
+    return ""
 
 
 RANKING_CONFIGS = {
@@ -499,7 +528,6 @@ def parse_games(data, timezone_name):
             "event_date": event_dt.date() if event_dt else None,
             "event_time": event_dt,
             "sport": event.get("_sport_name", "College Sports"),
-            "_sport": event.get("_sport", ""),
             "division": event.get("_division", "NCAA"),
             "home": home.get("team", {}).get("displayName", "Home"),
             "away": away.get("team", {}).get("displayName", "Away"),
@@ -563,143 +591,73 @@ def is_favorite(game, favorites):
 
 
 def _collect_watch_info(payload):
-    """Extract broadcast/streaming and venue information from NCAA game-center data.
-
-    NCAA game details have changed shape over time, so this intentionally accepts
-    both singular/plural field names and nested broadcast/link objects.
-    """
+    """Extract broadcast/network names, actual stream/watch URLs, and venue separately."""
     if not payload:
-        return {"broadcasts": [], "venue": "", "links": []}
+        return {"broadcasts": [], "watch_urls": [], "venue": ""}
+    broadcasts, watch_urls, venues = [], [], []
+    broadcast_keys = {"network", "networkname", "broadcast", "broadcastname", "tv", "channel"}
+    watch_keys = {"watch", "stream", "streamurl", "watchurl", "videourl", "url", "href", "link"}
+    venue_keys = {"venue", "venuename", "stadium", "arenaname", "location"}
 
-    broadcasts, venues, links = [], [], []
-    broadcast_keys = {
-        "network", "networkname", "broadcast", "broadcasts", "broadcastname",
-        "tv", "tvnetwork", "channel", "channels", "watch", "stream",
-        "streaming", "streamingservice", "streamingnetwork", "watchonline",
-    }
-    venue_keys = {
-        "venue", "venuename", "stadium", "arenaname", "location",
-        "site", "sitedetails", "facility", "facilityname",
-    }
-    link_keys = {"url", "href", "link", "watchurl", "streamurl", "videourl", "broadcasturl"}
-
-    def add_text(target, value):
+    def add_text(bucket, value):
         if isinstance(value, str) and value.strip():
-            target.append(value.strip())
-
-    def inspect_object(obj):
-        if not isinstance(obj, dict):
-            return
-        # Common display fields for a broadcast/network object.
-        label = (obj.get("name") or obj.get("title") or obj.get("displayName")
-                 or obj.get("network") or obj.get("shortName"))
-        url = obj.get("url") or obj.get("href") or obj.get("watchUrl") or obj.get("streamUrl")
-        if label:
-            add_text(broadcasts, label)
-        if isinstance(url, str) and url.startswith(("http://", "https://")):
-            links.append((str(label or "Watch").strip(), url))
+            bucket.append(value.strip())
 
     def walk(value):
         if isinstance(value, dict):
+            # Treat likely video/live objects specially so their URL is not confused with venue data.
             for k, v in value.items():
-                nk = str(k).lower().replace("_", "").replace("-", "").replace(" ", "")
+                nk = str(k).lower().replace("_", "").replace("-", "")
                 if nk in broadcast_keys:
                     vals = v if isinstance(v, list) else [v]
                     for x in vals:
                         if isinstance(x, dict):
-                            inspect_object(x)
-                            # Some feeds nest the actual network inside another object.
-                            add_text(broadcasts, x.get("networkName"))
-                            add_text(broadcasts, x.get("network"))
+                            add_text(broadcasts, x.get("name") or x.get("title") or x.get("displayName") or x.get("network"))
+                            add_text(watch_urls, x.get("url") or x.get("href") or x.get("link"))
                         else:
                             add_text(broadcasts, x)
-                elif nk in venue_keys:
+                elif nk in watch_keys:
+                    if isinstance(v, str) and v.startswith(("http://", "https://")):
+                        watch_urls.append(v.strip())
+                    elif isinstance(v, dict):
+                        add_text(watch_urls, v.get("url") or v.get("href") or v.get("link"))
+                if nk in venue_keys:
                     if isinstance(v, dict):
-                        add_text(venues, v.get("name") or v.get("displayName") or v.get("fullName") or v.get("shortName"))
-                    else:
-                        add_text(venues, v)
-                elif nk in link_keys and isinstance(v, str) and v.startswith(("http://", "https://")):
-                    links.append(("Watch", v))
+                        v = v.get("name") or v.get("displayName") or v.get("fullName")
+                    add_text(venues, v)
                 walk(v)
         elif isinstance(value, list):
             for child in value:
                 walk(child)
-
     walk(payload)
 
     def unique(values):
-        out = []
-        seen = set()
+        out, seen = [], set()
         for value in values:
-            key = str(value).strip().lower()
-            if key and key not in seen:
-                seen.add(key)
-                out.append(str(value).strip())
+            if not isinstance(value, str) or not value.strip():
+                continue
+            value = value.strip()
+            key = value.lower()
+            if key not in seen:
+                seen.add(key); out.append(value)
         return out
 
-    unique_links = []
-    seen_urls = set()
-    for label, url in links:
-        if url not in seen_urls:
-            seen_urls.add(url)
-            unique_links.append({"label": label or "Watch", "url": url})
-
     return {
-        "broadcasts": unique(broadcasts)[:8],
+        "broadcasts": unique(broadcasts)[:6],
+        "watch_urls": unique(watch_urls)[:6],
         "venue": unique(venues)[:1][0] if venues else "",
-        "links": unique_links[:6],
     }
 
 
 @st.cache_data(ttl=30)
 def get_game_watch_info(game_id):
     if not game_id or str(game_id).startswith("ncaa-"):
-        return {"broadcasts": [], "venue": "", "links": []}
+        return {"broadcasts": [], "watch_urls": [], "venue": ""}
     detail = get_ncaa_game_detail(game_id)
     return _collect_watch_info(detail)
 
 
-def _ranking_team_key(name):
-    import re
-    text = str(name or "").strip()
-    text = re.sub(r"\s*\([^)]*\)\s*$", "", text)
-    aliases = {
-        "southern cal": "usc",
-        "miami (fl)": "miami",
-    }
-    text = aliases.get(text.lower(), text)
-    return _normalize_team_name(text)
-
-
-def _extract_ranking_map(payload):
-    rows = _extract_ranking_rows(payload)
-    result = {}
-    for row in rows:
-        key = _ranking_team_key(row.get("Team"))
-        if key:
-            result[key] = str(row.get("Rank", "")).strip()
-    return result
-
-
-@st.cache_data(ttl=900)
-def get_inline_ranking_map(sport_slug):
-    for _label, config in RANKING_CONFIGS.items():
-        if config[0] == sport_slug:
-            try:
-                return _extract_ranking_map(get_ncaa_rankings(*config))
-            except Exception:
-                return {}
-    return {}
-
-
-def _team_rank(rankings, team_name):
-    if not rankings:
-        return ""
-    rank = rankings.get(_ranking_team_key(team_name))
-    return f"#{rank}" if rank else ""
-
-
-def render_game(game, favorite=False, close=False, instance_key="main", rankings=None):
+def render_game(game, favorite=False, close=False):
     status_badge = "🔴 LIVE" if game["state"] == "in" else ("FINAL" if game["state"] == "post" else "UPCOMING")
     meta = " • ".join(x for x in [
         status_badge,
@@ -712,10 +670,6 @@ def render_game(game, favorite=False, close=False, instance_key="main", rankings
 
     away_logo = f'<img src="{game["away_logo"]}" width="36" style="vertical-align:middle;margin-right:8px;">' if game["away_logo"] else ""
     home_logo = f'<img src="{game["home_logo"]}" width="36" style="vertical-align:middle;margin-right:8px;">' if game["home_logo"] else ""
-    away_rank = _team_rank(rankings, game.get("away", ""))
-    home_rank = _team_rank(rankings, game.get("home", ""))
-    away_rank_html = f'<span class="rank">{away_rank}</span> ' if away_rank else ""
-    home_rank_html = f'<span class="rank">{home_rank}</span> ' if home_rank else ""
 
     if game["state"] in ("in", "post"):
         away_score, home_score = game["away_score"], game["home_score"]
@@ -733,24 +687,20 @@ def render_game(game, favorite=False, close=False, instance_key="main", rankings
     st.markdown(f"""
     <div class="game-card">
       <div class="meta">{game['sport']} • {meta}</div>
-      <div class="team">{away_logo}{away_rank_html}{game['away']}<span class="score">{away_score}</span></div>
-      <div class="team">{home_logo}{home_rank_html}{game['home']}<span class="score">{home_score}</span></div>
+      <div class="team">{away_logo}{game['away']}<span class="score">{away_score}</span></div>
+      <div class="team">{home_logo}{game['home']}<span class="score">{home_score}</span></div>
       <div class="meta">Score difference: {game['diff']}{clock}{(' • Start: ' + start_time) if start_time else ''}</div>
     </div>
     """, unsafe_allow_html=True)
 
     if game.get("state") in ("pre", "in", "post"):
-        watch_key = f"watch_info_{instance_key}_{game['id']}"
+        watch_key = f"watch_info_{game['id']}_{game.get('_render_context','main')}"
         if watch_key not in st.session_state:
             st.session_state[watch_key] = None
-        if game.get("broadcasts") or game.get("venue"):
-            parts = []
-            if game.get("broadcasts"):
-                parts.append("📺 " + ", ".join(game["broadcasts"]))
-            if game.get("venue"):
-                parts.append("📍 " + game["venue"])
-            st.caption(" • ".join(parts))
-        if st.button("📺 Where to watch", key=f"watch_btn_{instance_key}_{game['id']}"):
+        # Keep venue separate from watch information. Venue is the physical site, not a streaming destination.
+        if game.get("venue"):
+            st.caption("📍 Venue: " + game["venue"])
+        if st.button("📺 Where to watch", key=f"watch_btn_{game['id']}_{game.get('_render_context','main')}"):
             try:
                 st.session_state[watch_key] = get_game_watch_info(game["id"])
             except Exception as exc:
@@ -760,25 +710,20 @@ def render_game(game, favorite=False, close=False, instance_key="main", rankings
             if info.get("error"):
                 st.warning(info["error"])
             else:
-                parts = []
                 if info.get("broadcasts"):
-                    parts.append("📺 Watch: " + ", ".join(info["broadcasts"]))
-                if info.get("venue"):
-                    parts.append("📍 Venue: " + info["venue"])
-                if parts:
-                    st.info(" • ".join(parts))
-                else:
-                    st.info("The NCAA game-center feed has not published a broadcast or venue for this game yet.")
-                for watch_link in info.get("links", []):
-                    st.markdown(f'[▶️ {watch_link["label"]}]({watch_link["url"]})')
-                st.markdown(f'[🏟️ Open NCAA Game Center](https://www.ncaa.com/game/{game["id"]})')
+                    st.success("📺 Broadcast: " + ", ".join(info["broadcasts"]))
+                if info.get("watch_urls"):
+                    for idx, url in enumerate(info["watch_urls"]):
+                        st.link_button("▶️ Watch / Stream", url, key=f"stream_{game['id']}_{game.get('_render_context','main')}_{idx}")
+                if not info.get("broadcasts") and not info.get("watch_urls"):
+                    st.info("No streaming or TV information has been published by the NCAA feed for this game yet. The venue is shown separately above.")
 
     if game.get("sport") == "🏐 Women's Volleyball" and game.get("state") in ("in", "post"):
-        key = f"volley_sets_{instance_key}_{game['id']}"
+        key = f"volley_sets_{game['id']}"
         if key not in st.session_state:
             st.session_state[key] = None
         button_label = "📊 Show set scores" if st.session_state[key] is None else "↻ Refresh set scores"
-        if st.button(button_label, key=f"btn_{instance_key}_{game['id']}"):
+        if st.button(button_label, key=f"btn_{game['id']}"):
             try:
                 detail = get_ncaa_game_detail(game["id"])
                 set_scores = _extract_volleyball_set_scores(
@@ -793,13 +738,13 @@ def render_game(game, favorite=False, close=False, instance_key="main", rankings
                     except Exception:
                         pass
                 st.session_state[key] = set_scores
-                st.session_state[f"volley_sets_error_{instance_key}_{game['id']}"] = ""
+                st.session_state[f"volley_sets_error_{game['id']}"] = ""
             except Exception as exc:
                 st.session_state[key] = []
-                st.session_state[f"volley_sets_error_{instance_key}_{game['id']}"] = f"Could not retrieve set scores: {type(exc).__name__}: {exc}"
+                st.session_state[f"volley_sets_error_{game['id']}"] = f"Could not retrieve set scores: {type(exc).__name__}: {exc}"
 
         if st.session_state.get(key) is not None:
-            error = st.session_state.get(f"volley_sets_error_{instance_key}_{game['id']}", "")
+            error = st.session_state.get(f"volley_sets_error_{game['id']}", "")
             if error:
                 st.warning(error)
             elif st.session_state[key]:
@@ -922,16 +867,6 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold):
     games = [g for g in games if g.get("event_date") == today]
 
     favorites = st.session_state.favorites
-    ranking_maps = {}
-    ranked_sports = {config[0] for config in RANKING_CONFIGS.values()}
-    selected_sports = set(sport_filter)
-    for sport_name, configs in NCAA_SPORTS.items():
-        if sport_name not in selected_sports:
-            continue
-        for sport_slug, _division in configs:
-            if sport_slug in ranked_sports:
-                ranking_maps[sport_name] = get_inline_ranking_map(sport_slug)
-                break
     live_games = [g for g in games if g["state"] == "in"]
     close_games = [g for g in live_games if g["diff"] < threshold]
     favorite_games = [g for g in games if is_favorite(g, favorites)]
@@ -969,9 +904,30 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold):
             else:
                 team_games.sort(key=lambda g: (g["state"] != "in", g["event_time"] or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone))))
                 for game in team_games:
-                    render_game(game, favorite=True, close=(game["state"] == "in" and game["diff"] < threshold), instance_key=f"myteam_{favorite_name}", rankings=ranking_maps.get(game.get("sport", ""), {}))
+                    render_game({**game, "_render_context": "myteams"}, favorite=True, close=(game["state"] == "in" and game["diff"] < threshold))
     else:
         st.info("Select teams in the sidebar to build your My Teams dashboard.")
+
+    st.markdown("---")
+    st.subheader("🏅 Rankings")
+    st.caption("Current NCAA poll data. Football and basketball use AP; volleyball uses the AVCA poll.")
+    ranking_choice = st.selectbox(
+        "Ranking",
+        list(RANKING_CONFIGS.keys()),
+        key="ranking_choice",
+    )
+    r_sport, r_division, r_poll = RANKING_CONFIGS[ranking_choice]
+    try:
+        ranking_payload = get_ncaa_rankings(r_sport, r_division, r_poll)
+        ranking_rows = _extract_ranking_rows(ranking_payload)
+        if ranking_rows:
+            st.dataframe(ranking_rows, use_container_width=True, hide_index=True)
+        else:
+            st.info("The NCAA ranking feed did not return ranked teams for this poll right now.")
+    except requests.RequestException as exc:
+        st.warning(f"Rankings are temporarily unavailable: {exc}")
+    except Exception as exc:
+        st.warning(f"Could not parse the NCAA rankings: {type(exc).__name__}: {exc}")
 
     st.markdown("---")
     st.subheader("🏆 Games — Sorted by Closeness")
@@ -980,7 +936,7 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold):
     else:
         st.caption("Live games are sorted closest first. Completed games follow.")
         for game in games_by_closeness:
-            render_game(game, favorite=is_favorite(game, favorites), close=(game["state"] == "in" and game["diff"] < threshold), instance_key="main", rankings=ranking_maps.get(game.get("sport", ""), {}))
+            render_game({**game, "_render_context": "main"}, favorite=is_favorite(game, favorites), close=(game["state"] == "in" and game["diff"] < threshold))
 
     st.markdown("---")
     st.subheader("📅 Upcoming Today")
@@ -989,7 +945,7 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold):
     else:
         st.caption("Upcoming games are sorted by start time and placed below the live/completed games.")
         for game in upcoming_today:
-            render_game(game, favorite=is_favorite(game, favorites), close=False, instance_key="upcoming", rankings=ranking_maps.get(game.get("sport", ""), {}))
+            render_game({**game, "_render_context": "upcoming"}, favorite=is_favorite(game, favorites), close=False)
 
 
 live_dashboard(timezone_label, selected_timezone, sport_filter, threshold)
