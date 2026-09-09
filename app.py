@@ -240,10 +240,12 @@ def parse_games(data, timezone_name):
         state = type_info.get("state", "pre")
 
         event_dt = None
-        try:
-            event_dt = datetime.fromisoformat(event.get("date", "").replace("Z", "+00:00")).astimezone(ZoneInfo(timezone_name))
-        except (TypeError, ValueError):
-            pass
+        raw_event_date = event.get("date")
+        if isinstance(raw_event_date, str) and raw_event_date.strip():
+            try:
+                event_dt = datetime.fromisoformat(raw_event_date.replace("Z", "+00:00")).astimezone(ZoneInfo(timezone_name))
+            except (TypeError, ValueError):
+                pass
 
         games.append({
             "id": event.get("id"),
