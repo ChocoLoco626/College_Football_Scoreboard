@@ -18,13 +18,13 @@ SPORTS = {
         ("football", "college-football", "FBS", 80),
         ("football", "college-football", "FCS", 81),
     ],
-    "⚽ Men's Soccer": [("soccer", "mens-college-soccer", "NCAA", None)],
-    "⚽ Women's Soccer": [("soccer", "womens-college-soccer", "NCAA", None)],
-    "🏀 Men's Basketball": [("basketball", "mens-college-basketball", "NCAA", None)],
-    "🏀 Women's Basketball": [("basketball", "womens-college-basketball", "NCAA", None)],
-    "🏐 Women's Volleyball": [("volleyball", "womens-college-volleyball", "NCAA", None)],
-    "⚾ Baseball": [("baseball", "college-baseball", "NCAA", None)],
-    "🥎 Softball": [("softball", "college-softball", "NCAA", None)],
+    "⚽ Men's Soccer": [("soccer", "mens-college-soccer", "NCAA", 50)],
+    "⚽ Women's Soccer": [("soccer", "womens-college-soccer", "NCAA", 50)],
+    "🏀 Men's Basketball": [("basketball", "mens-college-basketball", "NCAA", 50)],
+    "🏀 Women's Basketball": [("basketball", "womens-college-basketball", "NCAA", 50)],
+    "🏐 Women's Volleyball": [("volleyball", "womens-college-volleyball", "NCAA", 50)],
+    "⚾ Baseball": [("baseball", "college-baseball", "NCAA", 50)],
+    "🥎 Softball": [("softball", "college-softball", "NCAA", 50)],
 }
 
 DEFAULT_FAVORITES = {"Kentucky": "96", "Auburn": "2", "West Florida": "2908"}
