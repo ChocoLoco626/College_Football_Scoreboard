@@ -858,6 +858,8 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold):
     c4.metric("🏆 Today's Games", len(games))
     st.markdown("---")
 
+    ranking_maps = get_inline_ranking_maps()
+
     st.subheader("⭐ My Teams")
     if favorite_games:
         for favorite_name, favorite_id in favorites.items():
@@ -871,8 +873,6 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold):
                     render_game({**game, "_render_context": "myteams"}, favorite=True, close=(game["state"] == "in" and game["diff"] < threshold), rankings=ranking_maps.get(game["sport"], {}))
     else:
         st.info("Select teams in the sidebar to build your My Teams dashboard.")
-
-    ranking_maps = get_inline_ranking_maps()
 
     st.markdown("---")
     st.subheader("🏆 Games — Sorted by Closeness")
@@ -892,5 +892,54 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold):
         for game in upcoming_today:
             render_game({**game, "_render_context": "upcoming"}, favorite=is_favorite(game, favorites), close=False, rankings=ranking_maps.get(game["sport"], {}))
 
+
+# Sidebar controls
+with st.sidebar:
+    st.header("⚙️ Settings")
+    timezone_label = st.selectbox(
+        "Time zone",
+        list(TIMEZONES.keys()),
+        index=list(TIMEZONES.keys()).index(DEFAULT_TIMEZONE),
+    )
+    selected_timezone = TIMEZONES[timezone_label]
+
+    sport_filter = st.multiselect(
+        "Sports",
+        list(SPORTS.keys()),
+        default=list(SPORTS.keys()),
+    )
+
+    threshold = st.slider(
+        "Close-game threshold",
+        min_value=1,
+        max_value=20,
+        value=7,
+        help="Live games with a score difference below this number are marked CLOSE.",
+    )
+
+    show_diagnostics = st.checkbox("Show diagnostics", value=False)
+
+    st.markdown("---")
+    st.subheader("⭐ Favorite Teams")
+    if "favorites" not in st.session_state:
+        st.session_state.favorites = dict(DEFAULT_FAVORITES)
+
+    favorite_options = list(TEAM_IDS.keys())
+    current_favorites = [
+        name for name in favorite_options
+        if name in st.session_state.favorites
+    ]
+    selected_favorites = st.multiselect(
+        "My Teams",
+        favorite_options,
+        default=current_favorites,
+    )
+    st.session_state.favorites = {
+        name: TEAM_IDS[name] for name in selected_favorites
+    }
+
+    if st.button("🔄 Refresh now", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
 
 live_dashboard(timezone_label, selected_timezone, sport_filter, threshold)
