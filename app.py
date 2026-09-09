@@ -954,14 +954,26 @@ def _game_label(game):
     return f"{game.get('away', 'Away')} at {game.get('home', 'Home')}"
 
 
-def render_alert_toggle(game, context):
-    """Render one persistent alert toggle per game. Only main/upcoming cards get controls."""
+def render_alert_toggle(game, context, instance=0):
+    """Render a persistent alert toggle with a unique Streamlit widget key.
+
+    The same game can occasionally appear more than once in a filtered dashboard,
+    so the widget key includes the render context/instance while the stored alert
+    preference remains keyed only to the game ID.
+    """
     if context not in ("main", "upcoming"):
         return bool(st.session_state.get(_alert_key(game["id"]), False))
-    key = _alert_key(game["id"])
-    if key not in st.session_state:
-        st.session_state[key] = False
-    return st.checkbox("🔔 Flash alerts", key=key, help="Flash the screen when this game's score changes.")
+    state_key = _alert_key(game["id"])
+    widget_key = f"{state_key}_{context}_{instance}"
+    enabled = bool(st.session_state.get(state_key, False))
+    value = st.checkbox(
+        "🔔 Flash alerts",
+        value=enabled,
+        key=widget_key,
+        help="Flash the screen when this game's score changes.",
+    )
+    st.session_state[state_key] = value
+    return value
 
 
 def update_score_alerts(all_games):
@@ -1057,7 +1069,7 @@ def render_conference_standings(selected_sport, selected_conference=""):
 
 
 @st.fragment(run_every="30s")
-def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, conference_filter, top25_only, date_offset, live_only, favorites_only, standings_sport, standings_conference):
+def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, conference_filter, top25_only, date_offset, live_only, favorites_only):
     st.title("🏆 College Sports Live")
     selected_date = today_in_timezone(selected_timezone) + timedelta(days=date_offset)
     if date_offset == 0:
@@ -1144,23 +1156,18 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, c
 
     st.markdown("---")
     st.subheader("🏆 Games — Sorted by Closeness")
-    for game in live_sorted + final_sorted:
+    for i, game in enumerate(live_sorted + final_sorted):
         context = "main"
-        render_alert_toggle(game, context)
+        render_alert_toggle(game, context, i)
         render_game({**game, "_render_context":context}, favorite=is_favorite(game, favorites), close=(game["state"]=="in" and game["diff"]<threshold), rankings=ranking_maps.get(game["sport"], {}), records=record_maps.get(game["sport"], {}))
     if not (live_sorted or final_sorted): st.info("No live or completed games match the current filters.")
 
     st.markdown("---")
     st.subheader("📅 Upcoming")
     if not upcoming_today: st.info("No upcoming games match the current filters.")
-    for game in upcoming_today:
-        render_alert_toggle(game, "upcoming")
+    for i, game in enumerate(upcoming_today):
+        render_alert_toggle(game, "upcoming", i)
         render_game({**game, "_render_context":"upcoming"}, favorite=is_favorite(game, favorites), close=False, rankings=ranking_maps.get(game["sport"], {}), records=record_maps.get(game["sport"], {}))
-
-    st.markdown("---")
-    st.subheader("📊 Conference Standings")
-    st.caption("NCAA conference standings for the selected sport.")
-    render_conference_standings(standings_sport, standings_conference)
 
 
 # Sidebar controls
@@ -1197,12 +1204,6 @@ with st.sidebar:
     st.session_state.favorites = {name: TEAM_IDS[name] for name in selected_favorites}
 
     st.markdown("---")
-    st.subheader("📊 Standings")
-    standings_sport = st.selectbox("Sport for standings", list(SPORTS.keys()), index=0)
-    standings_conference = st.selectbox("Conference", ["All conferences"] + conference_options, index=0)
-    if standings_conference == "All conferences": standings_conference = ""
-
-    st.markdown("---")
     st.subheader("🔔 Score Alerts")
     st.caption("Use the 🔔 Flash alerts checkbox on a game card. Marked games flash on screen when their score changes.")
     show_diagnostics = st.checkbox("Show diagnostics", value=False)
@@ -1210,5 +1211,5 @@ with st.sidebar:
     if st.button("🔄 Refresh now", use_container_width=True):
         st.cache_data.clear(); st.rerun()
 
-live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, conference_filter, top25_only, date_offset, live_only, favorites_only, standings_sport, standings_conference)
+live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, conference_filter, top25_only, date_offset, live_only, favorites_only)
 
