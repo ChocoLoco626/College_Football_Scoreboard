@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 import base64
 import requests
+import time
 import streamlit as st
 from matchups import format_matchup_badges
 
@@ -1792,7 +1793,9 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, close_thresh
     st.caption(f"NCAA college scores • {date_label} • Game times shown in {timezone_label}")
 
     try:
+        refresh_started = time.perf_counter()
         data = get_all_scoreboards(selected_timezone, selected_date)
+        refresh_duration = time.perf_counter() - refresh_started
         games = parse_games(data, selected_timezone)
         games = dedupe_games(games)
 
@@ -1836,7 +1839,7 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, close_thresh
             freshness_class = "update-bad"
             freshness_text = f"Last updated {int(age_seconds // 60)} min ago"
         updated_display = fetched_at.strftime("%I:%M:%S %p %Z").lstrip("0") if fetched_at else "Unknown"
-        st.markdown(f'<div class="update-bar"><span class="{freshness_class}">🕐 {freshness_text}</span> &nbsp;•&nbsp; Updated at {updated_display} &nbsp;•&nbsp; Auto-refresh every {REFRESH_SECONDS}s<br><span class="{connection_class}">{connection_text}</span> <span class="meta">• {connection_detail}</span></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="update-bar"><span class="{freshness_class}">🕐 {freshness_text}</span> &nbsp;•&nbsp; Updated at {updated_display} &nbsp;•&nbsp; Auto-refresh every {REFRESH_SECONDS}s &nbsp;•&nbsp; Refresh took {refresh_duration:.2f}s<br><span class="{connection_class}">{connection_text}</span> <span class="meta">• {connection_detail}</span></div>', unsafe_allow_html=True)
     except Exception as exc:
         st.error(f"Could not retrieve scores: {type(exc).__name__}: {exc}")
         st.stop()
