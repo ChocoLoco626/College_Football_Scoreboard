@@ -333,6 +333,19 @@ def get_ncaa_boxscore(game_id):
     return response.json()
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def get_ncaa_volleyball_boxscore(game_id):
+    """Call NCAA's volleyball-specific box-score query directly."""
+    if not game_id or str(game_id).startswith("ncaa-"): return None
+    try:
+        hash_value="4320484382257c2a7ac3be318db2dee09a7fb74029448825c285d5dbdda365ae"
+        url="https://sdataprod.ncaa.com/"
+        params={"extensions":'{"persistedQuery":{"version":1,"sha256Hash":"'+hash_value+'"}}',"variables":'{"contestId":"'+str(game_id)+'","staticTestEnv":null}'}
+        r=requests.get(url,params=params,timeout=10,headers={"User-Agent":"Mozilla/5.0"})
+        r.raise_for_status(); return r.json()
+    except Exception: return None
+
+
 def _walk_json(value):
     if isinstance(value, dict):
         yield value
@@ -555,8 +568,31 @@ def _extract_volleyball_set_scores(payload, away_id="", home_id=""):
         if rows:
             return rows
 
+    # Last-resort structured-team scan. Some current NCAA game-center payloads
+    # put each team's line scores on its own team object.
+    team_arrays = []
+    score_keys = {"linescores", "linescore", "periodscores", "periodscore", "setscores", "setscore"}
+    for obj in _walk_json(payload):
+        if not isinstance(obj, dict): continue
+        team = obj.get("team") if isinstance(obj.get("team"), dict) else obj
+        tid = str(team.get("id") or obj.get("teamId") or "")
+        for key, value in obj.items():
+            if key_norm(key) not in score_keys or not isinstance(value, list): continue
+            vals=[]
+            for row in value:
+                raw = row.get("score", row.get("value", row.get("points", row.get("displayValue")))) if isinstance(row, dict) else row
+                if isinstance(raw,str):
+                    m=re.search(r"-?\d+",raw); raw=m.group(0) if m else None
+                n=_first_number(raw)
+                if n is not None and 0 <= n <= 60: vals.append(n)
+            if vals: team_arrays.append((tid,vals))
+    if len(team_arrays)>=2:
+        away_row=next((r for r in team_arrays if away_id and r[0]==str(away_id)),None)
+        home_row=next((r for r in team_arrays if home_id and r[0]==str(home_id)),None)
+        if away_row and home_row:
+            n=min(len(away_row[1]),len(home_row[1]))
+            if n: return [{"Set":str(i+1),"Away":away_row[1][i],"Home":home_row[1][i]} for i in range(n)]
     return []
-
 
 
 def _extract_vb_scores_from_pbp(payload, away_id="", home_id=""):
@@ -603,102 +639,109 @@ def _extract_vb_scores_from_pbp(payload, away_id="", home_id=""):
     return [{"Set": str(n), "Away": latest[n][0], "Home": latest[n][1]} for n in sorted(latest)]
 
 
+def _extract_vb_label_value_sets(payload, away_id="", home_id=""):
+    """Parse common NCAA stat-row shapes such as Set 1 -> 11 on each team."""
+    if not payload: return []
+    team_rows=[]
+    for obj in _walk_json(payload):
+        if not isinstance(obj,dict): continue
+        team=obj.get("team") if isinstance(obj.get("team"),dict) else None
+        tid=str((team or {}).get("id") or obj.get("teamId") or "")
+        if not tid: continue
+        found={}
+        for child in _walk_json(obj):
+            if not isinstance(child,dict): continue
+            label=str(child.get("label") or child.get("name") or child.get("displayName") or child.get("statName") or child.get("description") or "")
+            m=re.search(r"(?:set|period)\s*(\d+)",label,re.I)
+            if not m: continue
+            raw=child.get("value",child.get("score",child.get("points",child.get("displayValue",child.get("statValue")))))
+            n=_first_number(raw)
+            if n is not None and 0 <= n <= 60: found[int(m.group(1))]=n
+        if found: team_rows.append((tid,found))
+    away=next((x[1] for x in team_rows if away_id and x[0]==str(away_id)),None)
+    home=next((x[1] for x in team_rows if home_id and x[0]==str(home_id)),None)
+    if away is not None and home is not None:
+        return [{"Set":str(i),"Away":away[i],"Home":home[i]} for i in sorted(set(away)&set(home))]
+    return []
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def get_volleyball_set_info(game_id, away_id="", home_id=""):
-
-    """Return volleyball set wins and points-per-set from NCAA game-center data."""
+    """Return volleyball set totals and per-set point scores from NCAA sources."""
     if not game_id or str(game_id).startswith("ncaa-"):
         return None
 
-    # The game endpoint is normally enough. Only fall back to boxscore if the
-    # primary endpoint does not contain parseable set scores. This avoids the
-    # previous pattern of making two HTTP requests for every volleyball game.
+    candidate_rows = []
     try:
         payload = get_ncaa_game_detail(game_id)
+        if payload:
+            candidate_rows = _extract_volleyball_set_scores(payload, away_id, home_id)
     except Exception:
-        payload = None
+        pass
 
-    payloads = [payload] if payload else []
-    if payload:
+    if not candidate_rows:
         try:
-            rows = _extract_volleyball_set_scores(payload, away_id, home_id)
-        except Exception:
-            rows = []
-        if rows:
-            payloads = [payload]
-        else:
-            payloads = []
-
-    if not payloads:
-        try:
-            fallback = get_ncaa_boxscore(game_id)
-            if fallback:
-                payloads.append(fallback)
+            payload = get_ncaa_boxscore(game_id)
+            if payload:
+                candidate_rows = _extract_volleyball_set_scores(payload, away_id, home_id)
+                if not candidate_rows:
+                    candidate_rows = _extract_vb_label_value_sets(payload, away_id, home_id)
         except Exception:
             pass
 
-    for payload in payloads:
+    # Direct volleyball-specific NCAA GraphQL query. This avoids relying on the
+    # wrapper's basketball-first hash discovery and is the most targeted source.
+    if not candidate_rows:
+        payload = get_ncaa_volleyball_boxscore(game_id)
+        if payload:
+            candidate_rows = _extract_volleyball_set_scores(payload, away_id, home_id)
+            if not candidate_rows:
+                candidate_rows = _extract_vb_label_value_sets(payload, away_id, home_id)
+
+    # Last resort: reconstruct from NCAA play-by-play snapshots.
+    if not candidate_rows:
+        candidate_rows = _extract_vb_scores_from_pbp(
+            get_ncaa_volleyball_play_by_play(game_id), away_id, home_id
+        )
+
+    if not candidate_rows:
+        return None
+
+    # Remove duplicate set labels and keep sensible volleyball scores.
+    rows=[]; seen=set()
+    for idx,row in enumerate(candidate_rows,1):
         try:
-            rows = _extract_volleyball_set_scores(payload, away_id, home_id)
-        except Exception:
-            rows = []
-        if not rows:
+            a=int(row.get("Away")); h=int(row.get("Home"))
+        except (TypeError,ValueError):
             continue
-        away_points = [r["Away"] for r in rows]
-        home_points = [r["Home"] for r in rows]
+        label=str(row.get("Set") or idx)
+        if label in seen or not (0 <= a <= 60 and 0 <= h <= 60):
+            continue
+        seen.add(label); rows.append({"Set":label,"Away":a,"Home":h})
+    if not rows:
+        return None
 
-        # Treat the final populated row as the live set when it has not yet
-        # reached a legal volleyball set-ending score. This keeps the main
-        # score set-based while exposing the current point-by-point set score.
-        def set_complete(a, h, set_number):
-            target = 15 if set_number >= 5 else 25
-            return max(a, h) >= target and abs(a - h) >= 2
+    def set_complete(a,h,set_number):
+        target=15 if set_number>=5 else 25
+        return max(a,h)>=target and abs(a-h)>=2
 
-        completed_rows = []
-        current_set = None
-        for idx, row in enumerate(rows, start=1):
-            a, h = row["Away"], row["Home"]
-            if set_complete(a, h, idx):
-                completed_rows.append(row)
-            elif idx == len(rows):
-                current_set = row
+    completed=[]; current=None
+    for idx,row in enumerate(rows,1):
+        if set_complete(row["Away"],row["Home"],idx):
+            completed.append(row)
+        elif idx == len(rows):
+            current=row
 
-        away_sets = sum(1 for row in completed_rows if row["Away"] > row["Home"])
-        home_sets = sum(1 for row in completed_rows if row["Home"] > row["Away"])
-        return {
-            "rows": rows,
-            "away_sets": away_sets,
-            "home_sets": home_sets,
-            "away_points": away_points,
-            "home_points": home_points,
-            "current_set_number": len(completed_rows) + 1 if current_set else None,
-            "current_set_away": current_set["Away"] if current_set else None,
-            "current_set_home": current_set["Home"] if current_set else None,
-        }
-
-    # Last resort: the NCAA generic PBP feed can contain the running score after each rally.
-    pbp_rows = _extract_vb_scores_from_pbp(get_ncaa_volleyball_play_by_play(game_id), away_id, home_id)
-    if pbp_rows:
-        completed_rows = []
-        current_set = None
-        for idx, row in enumerate(pbp_rows, start=1):
-            a, h = row["Away"], row["Home"]
-            target = 15 if idx >= 5 else 25
-            if max(a, h) >= target and abs(a - h) >= 2:
-                completed_rows.append(row)
-            elif idx == len(pbp_rows):
-                current_set = row
-        return {
-            "rows": pbp_rows,
-            "away_sets": sum(r["Away"] > r["Home"] for r in completed_rows),
-            "home_sets": sum(r["Home"] > r["Away"] for r in completed_rows),
-            "away_points": [r["Away"] for r in pbp_rows],
-            "home_points": [r["Home"] for r in pbp_rows],
-            "current_set_number": len(completed_rows) + 1 if current_set else None,
-            "current_set_away": current_set["Away"] if current_set else None,
-            "current_set_home": current_set["Home"] if current_set else None,
-        }
-    return None
+    return {
+        "rows": rows,
+        "away_sets": sum(r["Away"] > r["Home"] for r in completed),
+        "home_sets": sum(r["Home"] > r["Away"] for r in completed),
+        "away_points": [r["Away"] for r in rows],
+        "home_points": [r["Home"] for r in rows],
+        "current_set_number": len(completed)+1 if current else None,
+        "current_set_away": current["Away"] if current else None,
+        "current_set_home": current["Home"] if current else None,
+    }
 
 
 def _volleyball_live_tracker(game):
@@ -1601,6 +1644,21 @@ def _extract_espn_vb_scores(event, away_name, home_name):
     return rows, current_set, current_away, current_home
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def get_espn_volleyball_summary(event_id):
+    if not event_id: return None
+    try:
+        r=requests.get("https://site.api.espn.com/apis/site/v2/sports/volleyball/womens-college-volleyball/summary", params={"event":str(event_id)}, timeout=8, headers={"User-Agent":"Mozilla/5.0"})
+        r.raise_for_status(); return r.json()
+    except Exception: return None
+
+def _espn_summary_event(payload):
+    if not isinstance(payload,dict): return None
+    header=payload.get("header") or {}
+    comps=header.get("competitions") or payload.get("competitions") or []
+    return {"competitions":comps,"status":header.get("status") or payload.get("status") or {}} if comps else None
+
+
 def apply_espn_volleyball_fallback(games, target_date):
     """Fill missing volleyball set history/current points from one cached ESPN feed."""
     targets = [
@@ -1622,6 +1680,10 @@ def apply_espn_volleyball_fallback(games, target_date):
     for game in targets:
         for event in events:
             extracted = _extract_espn_vb_scores(event, game.get("away", ""), game.get("home", ""))
+            if not extracted:
+                summary_event = _espn_summary_event(get_espn_volleyball_summary(event.get("id")))
+                if summary_event:
+                    extracted = _extract_espn_vb_scores(summary_event, game.get("away", ""), game.get("home", ""))
             if not extracted:
                 continue
             rows, set_no, current_away, current_home = extracted
@@ -1756,6 +1818,26 @@ def parse_games(data, timezone_name, target_date=None, fetch_volleyball_details=
         games = apply_espn_volleyball_fallback(games, target_date)
     return games
 
+
+def enrich_volleyball_details(games):
+    """Fetch detailed NCAA volleyball linescores for an already-filtered subset."""
+    targets=[g for g in games if g.get("sport")=="🏐 Women's Volleyball" and g.get("state") in ("in","post") and g.get("id") and not str(g.get("id")).startswith("ncaa-")]
+    if not targets: return games
+    def fetch(g): return g,get_volleyball_set_info(g.get("id"),g.get("away_id",""),g.get("home_id",""))
+    with ThreadPoolExecutor(max_workers=min(4,len(targets))) as ex:
+        futures=[ex.submit(fetch,g) for g in targets]
+        for f in as_completed(futures):
+            try: g,info=f.result()
+            except Exception: continue
+            if not info: continue
+            g["away_score"]=info["away_sets"]; g["home_score"]=info["home_sets"]
+            g["away_points_by_set"]=info["away_points"]; g["home_points_by_set"]=info["home_points"]
+            g["volleyball_set_scores"]=info["rows"]
+            g["volleyball_current_set"]=info.get("current_set_number") or g.get("volleyball_current_set")
+            g["volleyball_current_away"]=info.get("current_set_away") if info.get("current_set_away") is not None else g.get("volleyball_current_away")
+            g["volleyball_current_home"]=info.get("current_set_home") if info.get("current_set_home") is not None else g.get("volleyball_current_home")
+            g["diff"]=abs(info["away_sets"]-info["home_sets"])
+    return apply_espn_volleyball_fallback(games,None)
 
 def dedupe_games(games):
     """Remove duplicate NCAA events that can appear in multiple football feeds.
@@ -2306,7 +2388,7 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, close_thresh
         refresh_started = time.perf_counter()
         data = get_all_scoreboards(selected_timezone, selected_date, sport_filter)
         refresh_duration = time.perf_counter() - refresh_started
-        games = parse_games(data, selected_timezone, selected_date, fetch_volleyball_details=True)
+        games = parse_games(data, selected_timezone, selected_date, fetch_volleyball_details=not close_only)
         games = dedupe_games(games)
 
         # The NCAA football scoreboard can sometimes return the next slate of
@@ -2393,6 +2475,12 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, close_thresh
     live_games = [g for g in games if g["state"] == "in"]
     def close_limit(game):
         return int(close_thresholds.get(game.get("sport"), 7))
+    if close_only:
+        # In fast mode, fetch the heavier volleyball detail only for matches
+        # whose current set/match margin already qualifies as close.
+        close_vb_candidates = [g for g in live_games if g.get("sport") == "🏐 Women's Volleyball" and g.get("diff", 999) <= close_limit(g)]
+        if close_vb_candidates:
+            enrich_volleyball_details(close_vb_candidates)
     close_games = [g for g in live_games if g["diff"] <= close_limit(g)]
     other_live_games = [g for g in live_games if g["diff"] > close_limit(g)]
     if close_only:
@@ -2408,120 +2496,121 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, close_thresh
     c1,c2,c3,c4,c5 = st.columns(5)
     c1.metric("🔴 Live", len(live_games)); c2.metric("🔥 Close", len(close_games)); c3.metric("⭐ My Teams", len(favorite_games)); c4.metric("🏆 Games", len(games)); c5.metric("🔔 Alerts", sum(bool(st.session_state.get(_alert_key(g["id"]), False)) for g in all_games_for_alerts))
 
-    st.markdown("---")
-    st.subheader("⭐ My Teams")
-    if favorites:
-        favorite_items = list(favorites.items())
-        columns_per_row = 3
-        for row_start in range(0, len(favorite_items), columns_per_row):
-            row = favorite_items[row_start:row_start + columns_per_row]
-            cols = st.columns(columns_per_row)
-            for col, (favorite_name, favorite_id) in zip(cols, row):
-                with col:
-                    # Do not collapse a team's schedule to its first game.  A team
-                    # can play multiple games on the same date (doubleheaders,
-                    # tournaments, rescheduled games, etc.), so show every match.
-                    team_games = [g for g in games if is_favorite(g, {favorite_name: favorite_id})]
-                    team_games = sorted(
-                        team_games,
-                        key=lambda g: (
-                            0 if g["state"] == "in" else (1 if g["state"] == "pre" else 2),
-                            g.get("event_time") or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone)),
-                        ),
-                    )
-
-                    # Use the first available record across this team's games.
-                    favorite_record = ""
-                    for tg in team_games:
-                        opponent_is_home = _normalize_team_name(tg["home"]) in {
-                            _normalize_team_name(favorite_name)
-                        } | {
-                            _normalize_team_name(a) for a in FAVORITE_NAME_ALIASES.get(favorite_name, set())
-                        }
-                        if opponent_is_home:
-                            favorite_record = tg.get("home_record") or record_maps.get(tg["sport"], {}).get(_normalize_team_name(tg["home"])) or record_maps.get(tg["sport"], {}).get(f"id:{tg.get('home_id', '')}") or ""
-                        else:
-                            favorite_record = tg.get("away_record") or record_maps.get(tg["sport"], {}).get(_normalize_team_name(tg["away"])) or record_maps.get(tg["sport"], {}).get(f"id:{tg.get('away_id', '')}") or ""
-                        if favorite_record:
-                            break
-
-                    header_record = f" ({favorite_record})" if favorite_record else ""
-                    if not team_games:
+    if not close_only:
+        st.markdown("---")
+        st.subheader("⭐ My Teams")
+        if favorites:
+            favorite_items = list(favorites.items())
+            columns_per_row = 3
+            for row_start in range(0, len(favorite_items), columns_per_row):
+                row = favorite_items[row_start:row_start + columns_per_row]
+                cols = st.columns(columns_per_row)
+                for col, (favorite_name, favorite_id) in zip(cols, row):
+                    with col:
+                        # Do not collapse a team's schedule to its first game.  A team
+                        # can play multiple games on the same date (doubleheaders,
+                        # tournaments, rescheduled games, etc.), so show every match.
+                        team_games = [g for g in games if is_favorite(g, {favorite_name: favorite_id})]
+                        team_games = sorted(
+                            team_games,
+                            key=lambda g: (
+                                0 if g["state"] == "in" else (1 if g["state"] == "pre" else 2),
+                                g.get("event_time") or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone)),
+                            ),
+                        )
+    
+                        # Use the first available record across this team's games.
+                        favorite_record = ""
+                        for tg in team_games:
+                            opponent_is_home = _normalize_team_name(tg["home"]) in {
+                                _normalize_team_name(favorite_name)
+                            } | {
+                                _normalize_team_name(a) for a in FAVORITE_NAME_ALIASES.get(favorite_name, set())
+                            }
+                            if opponent_is_home:
+                                favorite_record = tg.get("home_record") or record_maps.get(tg["sport"], {}).get(_normalize_team_name(tg["home"])) or record_maps.get(tg["sport"], {}).get(f"id:{tg.get('home_id', '')}") or ""
+                            else:
+                                favorite_record = tg.get("away_record") or record_maps.get(tg["sport"], {}).get(_normalize_team_name(tg["away"])) or record_maps.get(tg["sport"], {}).get(f"id:{tg.get('away_id', '')}") or ""
+                            if favorite_record:
+                                break
+    
+                        header_record = f" ({favorite_record})" if favorite_record else ""
+                        if not team_games:
+                            st.markdown(
+                                f'<div class="myteam-card"><div class="myteam-name">⭐ {favorite_name}{header_record}</div>'
+                                f'<div class="myteam-status">No game on this date</div>'
+                                f'<div class="myteam-opponent">—</div></div>', unsafe_allow_html=True)
+                            continue
+    
+                        game_rows = []
+                        for game in team_games:
+                            home_aliases = {_normalize_team_name(favorite_name)} | {
+                                _normalize_team_name(a) for a in FAVORITE_NAME_ALIASES.get(favorite_name, set())
+                            }
+                            is_home = _normalize_team_name(game["home"]) in home_aliases
+                            opponent = game["away"] if is_home else game["home"]
+                            opponent_record = game.get("away_record") if is_home else game.get("home_record")
+                            opponent_record = opponent_record or record_maps.get(game["sport"], {}).get(_normalize_team_name(opponent)) or record_maps.get(game["sport"], {}).get(f"id:{game.get('away_id' if is_home else 'home_id', '')}") or ""
+                            favorite_game_record = game.get("home_record") if is_home else game.get("away_record")
+                            favorite_game_record = favorite_game_record or favorite_record
+    
+                            result_prefix = ""
+                            if game["state"] == "in":
+                                status = "🔴 LIVE"
+                                if game.get("sport") == "🏐 Women's Volleyball":
+                                    score = f'{_volleyball_score_label(game, "home")}–{_volleyball_score_label(game, "away")}'
+                                else:
+                                    score = f'{game["home_score"]}–{game["away_score"]}'
+                            elif game["state"] == "post":
+                                status = "FINAL"
+                                if game.get("sport") == "🏐 Women's Volleyball":
+                                    score = f'{_volleyball_score_label(game, "home")}–{_volleyball_score_label(game, "away")}'
+                                else:
+                                    score = f'{game["home_score"]}–{game["away_score"]}'
+                                fav_score = game["home_score"] if is_home else game["away_score"]
+                                opp_score = game["away_score"] if is_home else game["home_score"]
+                                try:
+                                    if int(fav_score) > int(opp_score):
+                                        result_prefix = "✅ WIN"
+                                    elif int(fav_score) < int(opp_score):
+                                        result_prefix = "❌ LOSS"
+                                    else:
+                                        result_prefix = "➖ TIE"
+                                except (TypeError, ValueError):
+                                    pass
+                            else:
+                                status = game.get("event_time").strftime("%I:%M %p %Z").lstrip("0") if game.get("event_time") else "UPCOMING"
+                                score = "—"
+    
+                            alert = bool(st.session_state.get(_alert_key(game["id"]), False))
+                            alert_text = " • 🔔" if alert else ""
+                            matchup_badges = format_matchup_badges(game)
+                            matchup_text = " • ".join(matchup_badges)
+                            result_text = "vs" if is_home else "at"
+                            favorite_icon = "🏠" if is_home else "✈️"
+                            opponent_icon = "✈️" if is_home else "🏠"
+                            favorite_team_label = f"{favorite_name}{f' ({favorite_game_record})' if favorite_game_record else ''} {favorite_icon}"
+                            opponent_label = f"{opponent}{f' ({opponent_record})' if opponent_record else ''} {opponent_icon}"
+                            game_rows.append(
+                                f'<div class="myteam-game-row">'
+                                f'<div class="myteam-status">{result_prefix + " • " if result_prefix else ""}{status}{alert_text} • {game["sport"]}{(" • " + matchup_text) if matchup_text else ""}</div>'
+                                f'<div class="myteam-score">{score}</div>'
+                                f'<div class="myteam-opponent">{favorite_team_label} {result_text} {opponent_label}</div>'
+                                f'</div>'
+                            )
+    
                         st.markdown(
                             f'<div class="myteam-card"><div class="myteam-name">⭐ {favorite_name}{header_record}</div>'
-                            f'<div class="myteam-status">No game on this date</div>'
-                            f'<div class="myteam-opponent">—</div></div>', unsafe_allow_html=True)
-                        continue
-
-                    game_rows = []
-                    for game in team_games:
-                        home_aliases = {_normalize_team_name(favorite_name)} | {
-                            _normalize_team_name(a) for a in FAVORITE_NAME_ALIASES.get(favorite_name, set())
-                        }
-                        is_home = _normalize_team_name(game["home"]) in home_aliases
-                        opponent = game["away"] if is_home else game["home"]
-                        opponent_record = game.get("away_record") if is_home else game.get("home_record")
-                        opponent_record = opponent_record or record_maps.get(game["sport"], {}).get(_normalize_team_name(opponent)) or record_maps.get(game["sport"], {}).get(f"id:{game.get('away_id' if is_home else 'home_id', '')}") or ""
-                        favorite_game_record = game.get("home_record") if is_home else game.get("away_record")
-                        favorite_game_record = favorite_game_record or favorite_record
-
-                        result_prefix = ""
-                        if game["state"] == "in":
-                            status = "🔴 LIVE"
-                            if game.get("sport") == "🏐 Women's Volleyball":
-                                score = f'{_volleyball_score_label(game, "home")}–{_volleyball_score_label(game, "away")}'
-                            else:
-                                score = f'{game["home_score"]}–{game["away_score"]}'
-                        elif game["state"] == "post":
-                            status = "FINAL"
-                            if game.get("sport") == "🏐 Women's Volleyball":
-                                score = f'{_volleyball_score_label(game, "home")}–{_volleyball_score_label(game, "away")}'
-                            else:
-                                score = f'{game["home_score"]}–{game["away_score"]}'
-                            fav_score = game["home_score"] if is_home else game["away_score"]
-                            opp_score = game["away_score"] if is_home else game["home_score"]
-                            try:
-                                if int(fav_score) > int(opp_score):
-                                    result_prefix = "✅ WIN"
-                                elif int(fav_score) < int(opp_score):
-                                    result_prefix = "❌ LOSS"
-                                else:
-                                    result_prefix = "➖ TIE"
-                            except (TypeError, ValueError):
-                                pass
-                        else:
-                            status = game.get("event_time").strftime("%I:%M %p %Z").lstrip("0") if game.get("event_time") else "UPCOMING"
-                            score = "—"
-
-                        alert = bool(st.session_state.get(_alert_key(game["id"]), False))
-                        alert_text = " • 🔔" if alert else ""
-                        matchup_badges = format_matchup_badges(game)
-                        matchup_text = " • ".join(matchup_badges)
-                        result_text = "vs" if is_home else "at"
-                        favorite_icon = "🏠" if is_home else "✈️"
-                        opponent_icon = "✈️" if is_home else "🏠"
-                        favorite_team_label = f"{favorite_name}{f' ({favorite_game_record})' if favorite_game_record else ''} {favorite_icon}"
-                        opponent_label = f"{opponent}{f' ({opponent_record})' if opponent_record else ''} {opponent_icon}"
-                        game_rows.append(
-                            f'<div class="myteam-game-row">'
-                            f'<div class="myteam-status">{result_prefix + " • " if result_prefix else ""}{status}{alert_text} • {game["sport"]}{(" • " + matchup_text) if matchup_text else ""}</div>'
-                            f'<div class="myteam-score">{score}</div>'
-                            f'<div class="myteam-opponent">{favorite_team_label} {result_text} {opponent_label}</div>'
-                            f'</div>'
+                            + ''.join(game_rows)
+                            + '</div>',
+                            unsafe_allow_html=True,
                         )
-
-                    st.markdown(
-                        f'<div class="myteam-card"><div class="myteam-name">⭐ {favorite_name}{header_record}</div>'
-                        + ''.join(game_rows)
-                        + '</div>',
-                        unsafe_allow_html=True,
-                    )
-    else:
-        st.info("Select teams in the sidebar to build your My Teams dashboard.")
-
-    st.markdown("---")
-    with st.expander("📈 Score Change History", expanded=False):
-        render_score_history(history)
+        else:
+            st.info("Select teams in the sidebar to build your My Teams dashboard.")
+    
+        st.markdown("---")
+        with st.expander("📈 Score Change History", expanded=False):
+            render_score_history(history)
 
     st.subheader("🔥 Close Games")
     close_sorted = sorted(close_games, key=lambda g: (g["diff"], g.get("event_time") or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone))))
@@ -2534,33 +2623,34 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, close_thresh
         render_alert_toggle(game, context, i)
         render_game({**game, "_render_context":context}, favorite=is_favorite(game, favorites), close=True, rankings=ranking_maps.get(game["sport"], {}), records=record_maps.get(game["sport"], {}), compact=compact_mode)
 
-    st.markdown("---")
-    st.subheader("📺 Other Live Games")
-    other_live_sorted = sorted(other_live_games, key=lambda g: (g.get("event_time") or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone)), g.get("diff", 999)))
-    if not other_live_sorted:
-        st.info("No other live games match the current filters.")
-    other_start = len(close_sorted)
-    for i, game in enumerate(other_live_sorted):
-        render_alert_toggle(game, "other-live", other_start + i)
-        render_game({**game, "_render_context":"other-live"}, favorite=is_favorite(game, favorites), close=False, rankings=ranking_maps.get(game["sport"], {}), records=record_maps.get(game["sport"], {}), compact=compact_mode)
 
-    st.markdown("---")
-    st.subheader("🏁 Final")
-    if not final_sorted:
-        st.info("No final games match the current filters.")
-    final_start = len(close_sorted)
-    for i, game in enumerate(final_sorted):
-        context = "main"
-        render_alert_toggle(game, context, final_start + i)
-        render_game({**game, "_render_context":context}, favorite=is_favorite(game, favorites), close=False, rankings=ranking_maps.get(game["sport"], {}), records=record_maps.get(game["sport"], {}), compact=compact_mode)
-
-    st.markdown("---")
-    st.subheader("📅 Upcoming")
-    if not upcoming_today: st.info("No upcoming games match the current filters.")
-    for i, game in enumerate(upcoming_today):
-        render_alert_toggle(game, "upcoming", i)
-        render_game({**game, "_render_context":"upcoming"}, favorite=is_favorite(game, favorites), close=False, rankings=ranking_maps.get(game["sport"], {}), records=record_maps.get(game["sport"], {}), compact=compact_mode)
-
+    if not close_only:
+        st.markdown("---")
+        st.subheader("📺 Other Live Games")
+        other_live_sorted = sorted(other_live_games, key=lambda g: (g.get("event_time") or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone)), g.get("diff", 999)))
+        if not other_live_sorted:
+            st.info("No other live games match the current filters.")
+        other_start = len(close_sorted)
+        for i, game in enumerate(other_live_sorted):
+            render_alert_toggle(game, "other-live", other_start + i)
+            render_game({**game, "_render_context":"other-live"}, favorite=is_favorite(game, favorites), close=False, rankings=ranking_maps.get(game["sport"], {}), records=record_maps.get(game["sport"], {}), compact=compact_mode)
+    
+        st.markdown("---")
+        st.subheader("🏁 Final")
+        if not final_sorted:
+            st.info("No final games match the current filters.")
+        final_start = len(close_sorted)
+        for i, game in enumerate(final_sorted):
+            context = "main"
+            render_alert_toggle(game, context, final_start + i)
+            render_game({**game, "_render_context":context}, favorite=is_favorite(game, favorites), close=False, rankings=ranking_maps.get(game["sport"], {}), records=record_maps.get(game["sport"], {}), compact=compact_mode)
+    
+        st.markdown("---")
+        st.subheader("📅 Upcoming")
+        if not upcoming_today: st.info("No upcoming games match the current filters.")
+        for i, game in enumerate(upcoming_today):
+            render_alert_toggle(game, "upcoming", i)
+            render_game({**game, "_render_context":"upcoming"}, favorite=is_favorite(game, favorites), close=False, rankings=ranking_maps.get(game["sport"], {}), records=record_maps.get(game["sport"], {}), compact=compact_mode)
 
 # Sidebar controls
 with st.sidebar:
