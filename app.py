@@ -517,17 +517,19 @@ def get_ncaa_scoreboard(sport_slug, division, sport_name, timezone_name, target_
                     except ValueError:
                         pass
 
-        # NCAA's football/legacy feeds can expose an epoch whose UTC/local
-        # calendar date is one day away from the feed's startDate.  The
-        # scoreboard request is already scoped to a calendar date, so when
-        # startDate is present and differs by exactly one day, preserve the
-        # feed's calendar date while keeping the actual clock/timezone. This
-        # prevents late-night games from appearing on the previous/next day.
+        # NCAA can expose a calendar date (startDate) separately from an
+        # epoch timestamp.  The epoch is authoritative for the clock/timezone,
+        # but its converted local date can be one day earlier/later than the
+        # NCAA contest calendar date.  Do NOT blindly replace the date on the
+        # epoch value: that can move unrelated games to the wrong day.
+        # Instead, when the scoreboard request is for a specific calendar date
+        # and NCAA supplied that same startDate, keep the NCAA calendar date
+        # while preserving the converted clock from the epoch.
         source_start_date = game.get("startDate")
-        if event_dt is not None and isinstance(source_start_date, str):
+        if event_dt is not None and isinstance(source_start_date, str) and target_date is not None:
             try:
                 source_day = date.fromisoformat(source_start_date[:10])
-                if abs((event_dt.date() - source_day).days) == 1:
+                if source_day == local_date and abs((event_dt.date() - source_day).days) == 1:
                     event_dt = event_dt.replace(year=source_day.year, month=source_day.month, day=source_day.day)
             except ValueError:
                 pass
@@ -701,27 +703,40 @@ def get_schedule_fallback_events(sport_slug, division, sport_name, timezone_name
             except (TypeError, ValueError, OverflowError):
                 pass
 
-        if event_dt is None:
-            start_date = node.get("startDate") or node.get("date") or node.get("gameDate")
-            if isinstance(start_date, str) and start_date:
-                try:
-                    # New NCAA schedule data's startTime is presented in ET.
-                    text = str(start_time).replace(" ET", "").replace(" EST", "").replace(" EDT", "").strip()
-                    import re
-                    m = re.search(r"(\d{1,2}:\d{2})\s*(AM|PM)?", text, re.I)
-                    if m:
-                        clock, ampm = m.group(1), m.group(2) or ""
-                        fmt = "%Y-%m-%d %I:%M %p" if ampm else "%Y-%m-%d %H:%M"
-                        naive = datetime.strptime(f"{start_date[:10]} {clock} {ampm}".strip(), fmt)
-                        event_dt = naive.replace(tzinfo=ZoneInfo("America/New_York")).astimezone(ZoneInfo(timezone_name))
-                    else:
-                        # A scheduled game with no announced kickoff (TBA)
-                        # still belongs to the selected calendar date. Use a
-                        # neutral noon placeholder in the user's timezone so
-                        # midnight conversion cannot move it to another date.
-                        event_dt = datetime.fromisoformat(start_date[:10]).replace(tzinfo=ZoneInfo(timezone_name), hour=12, minute=0)
-                except (TypeError, ValueError):
-                    pass
+        start_date = node.get("startDate") or node.get("date") or node.get("gameDate")
+        if event_dt is not None and isinstance(start_date, str) and start_date:
+            # schedule-alt may return an epoch whose local conversion crosses
+            # midnight relative to NCAA's contest calendar date. Keep the
+            # schedule's calendar date, but retain the real converted clock.
+            try:
+                source_day = date.fromisoformat(start_date[:10])
+                if abs((event_dt.date() - source_day).days) == 1:
+                    event_dt = event_dt.replace(year=source_day.year, month=source_day.month, day=source_day.day)
+            except ValueError:
+                pass
+
+        if event_dt is None and isinstance(start_date, str) and start_date:
+            try:
+                # New NCAA schedule data's startTime is presented in ET.
+                text = str(start_time).replace(" ET", "").replace(" EST", "").replace(" EDT", "").strip()
+                import re
+                m = re.search(r"(\d{1,2}:\d{2})\s*(AM|PM)?", text, re.I)
+                if m:
+                    clock, ampm = m.group(1), m.group(2) or ""
+                    fmt = "%Y-%m-%d %I:%M %p" if ampm else "%Y-%m-%d %H:%M"
+                    naive = datetime.strptime(f"{start_date[:10]} {clock} {ampm}".strip(), fmt)
+                    event_dt = naive.replace(tzinfo=ZoneInfo("America/New_York")).astimezone(ZoneInfo(timezone_name))
+                    # The schedule date is the contest calendar date. If ET ->
+                    # local conversion crossed midnight, preserve that date.
+                    source_day = date.fromisoformat(start_date[:10])
+                    if abs((event_dt.date() - source_day).days) == 1:
+                        event_dt = event_dt.replace(year=source_day.year, month=source_day.month, day=source_day.day)
+                else:
+                    # A scheduled game with no announced kickoff (TBA) still
+                    # belongs to the selected calendar date.
+                    event_dt = datetime.fromisoformat(start_date[:10]).replace(tzinfo=ZoneInfo(timezone_name), hour=12, minute=0)
+            except (TypeError, ValueError):
+                pass
 
         if event_dt is None or event_dt.date() != target_date:
             continue
