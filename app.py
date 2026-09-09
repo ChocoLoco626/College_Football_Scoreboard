@@ -3,6 +3,7 @@ from zoneinfo import ZoneInfo
 import base64
 import requests
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
 from matchups import format_matchup_badges
 
@@ -289,7 +290,7 @@ def get_inline_ranking_maps():
     return result
 
 
-@st.cache_data(ttl=15)
+@st.cache_data(ttl=60, show_spinner=False)
 def get_ncaa_game_detail(game_id):
     """Fetch NCAA game-center data on demand (used for volleyball set scores)."""
     if not game_id or str(game_id).startswith("ncaa-"):
@@ -300,7 +301,7 @@ def get_ncaa_game_detail(game_id):
     return response.json()
 
 
-@st.cache_data(ttl=15)
+@st.cache_data(ttl=60, show_spinner=False)
 def get_ncaa_boxscore(game_id):
     """Fetch the NCAA boxscore as a fallback for set/period scoring."""
     if not game_id or str(game_id).startswith("ncaa-"):
@@ -419,20 +420,35 @@ def _extract_volleyball_set_scores(payload, away_id="", home_id=""):
 
 
 
-@st.cache_data(ttl=15)
+@st.cache_data(ttl=60, show_spinner=False)
 def get_volleyball_set_info(game_id, away_id="", home_id=""):
     """Return volleyball set wins and points-per-set from NCAA game-center data."""
     if not game_id or str(game_id).startswith("ncaa-"):
         return None
 
-    payloads = []
-    for fetcher in (get_ncaa_game_detail, get_ncaa_boxscore):
+    # The game endpoint is normally enough. Only fall back to boxscore if the
+    # primary endpoint does not contain parseable set scores. This avoids the
+    # previous pattern of making two HTTP requests for every volleyball game.
+    try:
+        payload = get_ncaa_game_detail(game_id)
+    except Exception:
+        payload = None
+
+    payloads = [payload] if payload else []
+    if payload:
+        rows = _extract_volleyball_set_scores(payload, away_id, home_id)
+        if rows:
+            payloads = [payload]
+        else:
+            payloads = []
+
+    if not payloads:
         try:
-            payload = fetcher(game_id)
-            if payload:
-                payloads.append(payload)
+            fallback = get_ncaa_boxscore(game_id)
+            if fallback:
+                payloads.append(fallback)
         except Exception:
-            continue
+            pass
 
     for payload in payloads:
         rows = _extract_volleyball_set_scores(payload, away_id, home_id)
@@ -1150,22 +1166,38 @@ def parse_games(data, timezone_name):
             "tournament_name": event.get("_tournament_name", ""),
             "round_name": event.get("_round_name", ""),
         })
-    # Volleyball uses match sets as the primary score and points won in each
-    # set as the secondary score. Enrich only volleyball games; the game-center
-    # responses are cached for 15 seconds so the 30-second dashboard refresh
-    # stays lightweight.
-    for game in games:
-        if game.get("sport") != "🏐 Women's Volleyball" or game.get("state") not in ("in", "post"):
-            continue
-        info = get_volleyball_set_info(game.get("id"), game.get("away_id", ""), game.get("home_id", ""))
-        if not info:
-            continue
-        game["away_score"] = info["away_sets"]
-        game["home_score"] = info["home_sets"]
-        game["away_points_by_set"] = info["away_points"]
-        game["home_points_by_set"] = info["home_points"]
-        game["volleyball_set_scores"] = info["rows"]
-        game["diff"] = abs(info["away_sets"] - info["home_sets"])
+    # Volleyball set/point details used to be fetched serially, and each game
+    # could trigger both /game and /boxscore. That made a busy volleyball slate
+    # noticeably increase dashboard load time. Fetch the details in a small
+    # bounded pool instead. Results are cached for 60 seconds, while the main
+    # NCAA scoreboard still refreshes every 30 seconds.
+    volleyball_games = [
+        game for game in games
+        if game.get("sport") == "🏐 Women's Volleyball" and game.get("state") in ("in", "post")
+        and game.get("id") and not str(game.get("id")).startswith("ncaa-")
+    ]
+
+    def fetch_vb_info(game):
+        return game, get_volleyball_set_info(game.get("id"), game.get("away_id", ""), game.get("home_id", ""))
+
+    if volleyball_games:
+        # Four concurrent requests keeps the UI responsive without opening a
+        # large burst of connections to the NCAA API.
+        with ThreadPoolExecutor(max_workers=min(4, len(volleyball_games))) as executor:
+            futures = [executor.submit(fetch_vb_info, game) for game in volleyball_games]
+            for future in as_completed(futures):
+                try:
+                    game, info = future.result()
+                except Exception:
+                    continue
+                if not info:
+                    continue
+                game["away_score"] = info["away_sets"]
+                game["home_score"] = info["home_sets"]
+                game["away_points_by_set"] = info["away_points"]
+                game["home_points_by_set"] = info["home_points"]
+                game["volleyball_set_scores"] = info["rows"]
+                game["diff"] = abs(info["away_sets"] - info["home_sets"])
 
     return games
 
