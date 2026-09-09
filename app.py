@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 import requests
 import streamlit as st
 
@@ -59,7 +59,8 @@ st.markdown("""
 
 def get_scoreboard(sport, league, group=None):
     url = f"{ESPN_BASE}/{sport}/{league}/scoreboard"
-    params = {"limit": 1000}
+    # Explicitly request today so pregame events later today are included.
+    params = {"limit": 1000, "dates": datetime.now().strftime("%Y%m%d")}
     if group is not None:
         params["groups"] = str(group)
     response = requests.get(url, params=params, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
@@ -205,6 +206,17 @@ def live_dashboard():
                     render_game(game, favorite=True, close=(game["state"] == "in" and game["diff"] < threshold))
     else:
         st.info("Select teams in the sidebar to build your My Teams dashboard.")
+
+    st.markdown("---")
+    st.subheader("📅 Upcoming Today")
+    upcoming_today = [g for g in games if g["state"] == "pre"]
+    upcoming_today.sort(key=lambda g: (g["detail"] or ""))
+    if not upcoming_today:
+        st.info("No upcoming games are currently listed by ESPN for today in the selected sports.")
+    else:
+        st.caption("Games scheduled for later today, according to ESPN.")
+        for game in upcoming_today:
+            render_game(game, favorite=is_favorite(game, favorites), close=False)
 
     st.markdown("---")
     st.subheader("🏆 All Games — Sorted by Closeness")
