@@ -362,6 +362,11 @@ with st.sidebar:
     selected_timezone = TIMEZONES[timezone_label]
     sport_filter = st.multiselect("Sports", list(SPORTS.keys()), default=list(SPORTS.keys()))
     threshold = st.slider("Close-game threshold", 1, 30, 10)
+    show_diagnostics = st.checkbox(
+        "🛠️ Diagnostics",
+        value=False,
+        help="Show exactly what each sports data source returned, including volleyball.",
+    )
     st.divider()
     st.header("⭐ Favorite Teams")
     favorite_choices = st.multiselect("Teams", list(TEAM_IDS.keys()), default=list(DEFAULT_FAVORITES.keys()))
@@ -381,8 +386,70 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold):
         data = get_all_scoreboards(selected_timezone)
         games = parse_games(data, selected_timezone)
     except Exception as exc:
-        st.error(f"Could not retrieve ESPN scores: {exc}")
+        st.error(f"Could not retrieve scores: {type(exc).__name__}: {exc}")
         st.stop()
+
+    if show_diagnostics:
+        with st.expander("🛠️ Scoreboard Diagnostics", expanded=True):
+            st.write({
+                "selected_time_zone": timezone_label,
+                "selected_local_date": str(today_in_timezone(selected_timezone)),
+                "raw_combined_event_count": len(data.get("events", [])),
+                "parsed_game_count": len(games),
+                "errors": data.get("errors", []),
+            })
+            diagnostics = data.get("diagnostics", [])
+            if diagnostics:
+                for diag in diagnostics:
+                    sport_name = diag.get("sport", "Unknown sport")
+                    with st.container(border=True):
+                        st.markdown(f"**{sport_name}**")
+                        if diag.get("source"):
+                            st.caption(f"Source: {diag['source']}")
+                        if diag.get("url"):
+                            st.code(diag["url"], language="text")
+                        if "raw_game_count" in diag:
+                            st.write({
+                                "raw_games": diag.get("raw_game_count"),
+                                "parsed_events": diag.get("parsed_event_count"),
+                            })
+                        if "merged_event_count" in diag:
+                            st.write({"merged_ESPN_events": diag.get("merged_event_count")})
+                        requests_info = diag.get("requests", [])
+                        if requests_info:
+                            st.dataframe(requests_info, use_container_width=True, hide_index=True)
+                        if diag.get("sample_raw_keys"):
+                            st.write("Sample raw item keys:", diag["sample_raw_keys"][:5])
+                        if diag.get("sample_games"):
+                            st.write("Sample games:")
+                            st.json(diag["sample_games"][:10])
+            else:
+                st.warning("No source diagnostics were returned.")
+
+            volleyball_games = [
+                g for g in games if g.get("sport") == "🏐 Women's Volleyball"
+            ]
+            st.markdown("### Volleyball after parsing")
+            st.write({
+                "parsed_volleyball_games": len(volleyball_games),
+                "volleyball_dates": sorted({str(g.get("event_date")) for g in volleyball_games}),
+            })
+            if volleyball_games:
+                st.dataframe(
+                    [
+                        {
+                            "away": g["away"],
+                            "home": g["home"],
+                            "date": str(g.get("event_date")),
+                            "start": g.get("event_time").isoformat() if g.get("event_time") else None,
+                            "state": g["state"],
+                            "detail": g["detail"],
+                        }
+                        for g in volleyball_games
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
     selected = set(sport_filter)
     if selected:
