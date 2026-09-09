@@ -574,6 +574,102 @@ def _pretty_conference(value):
     return labels.get(key, str(value).strip())
 
 
+
+
+def _format_record_value(value):
+    """Normalize an NCAA record object/string into a compact W-L style string."""
+    if value in (None, ""):
+        return ""
+    if isinstance(value, str):
+        text = value.strip()
+        return text
+    if isinstance(value, dict):
+        # Common NCAA shapes: {wins, losses}, {win, loss}, {overallRecord: ...}
+        for key in ("display", "text", "record", "overallRecord", "winsLosses"):
+            if value.get(key) not in (None, ""):
+                return _format_record_value(value.get(key))
+        wins = value.get("wins", value.get("win", value.get("w")))
+        losses = value.get("losses", value.get("loss", value.get("l")))
+        if wins is not None and losses is not None:
+            return f"{wins}-{losses}"
+    return str(value).strip()
+
+
+def _extract_team_record(team):
+    """Find a team's current overall record across NCAA scoreboard response variants."""
+    if not isinstance(team, dict):
+        return ""
+    direct_keys = (
+        "record", "overallRecord", "winsLosses", "recordDisplay",
+        "overall_record", "overall", "teamRecord", "records",
+    )
+    for key in direct_keys:
+        if key in team:
+            record = _format_record_value(team.get(key))
+            if record:
+                return record
+    # Some NCAA responses nest record data under a team/standings object.
+    for value in team.values():
+        if isinstance(value, dict):
+            record = _extract_team_record(value)
+            if record:
+                return record
+    return ""
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_ncaa_standing_records(sport_slug, division):
+    """Fetch cached NCAA standings and build team-name/ID -> overall record maps."""
+    url = f"https://ncaa-api.henrygd.me/standings/{sport_slug}/{division}"
+    response = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+    response.raise_for_status()
+    payload = response.json()
+    result = {}
+
+    def walk(value):
+        if isinstance(value, dict):
+            team = value.get("team") if isinstance(value.get("team"), dict) else value
+            name = ""
+            if isinstance(team, dict):
+                name = team.get("name") or team.get("school") or team.get("teamName") or team.get("displayName") or ""
+            record = _extract_team_record(value)
+            if name and record:
+                result[_normalize_team_name(name)] = record
+                tid = team.get("id") if isinstance(team, dict) else None
+                if tid not in (None, ""):
+                    result[f"id:{tid}"] = record
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(payload)
+    return result
+
+
+def get_record_maps_for_games(games):
+    """Merge scoreboard records, cached standings records, and ranking records."""
+    maps = {}
+    sport_slugs = {
+        "🏈 Football": ["football", "fbs"],
+        "⚽ Men's Soccer": ["soccer-men", "d1"],
+        "⚽ Women's Soccer": ["soccer-women", "d1"],
+        "🏀 Men's Basketball": ["basketball-men", "d1"],
+        "🏀 Women's Basketball": ["basketball-women", "d1"],
+        "🏐 Women's Volleyball": ["volleyball-women", "d1"],
+        "⚾ Baseball": ["baseball", "d1"],
+        "🥎 Softball": ["softball", "d1"],
+    }
+    needed = {g.get("sport") for g in games if g.get("sport") in sport_slugs}
+    for sport in needed:
+        slug, division = sport_slugs[sport]
+        try:
+            maps[sport] = get_ncaa_standing_records(slug, division)
+        except Exception:
+            maps[sport] = {}
+    return maps
+
 def parse_games(data, timezone_name):
     games = []
     for event in data.get("events", []):
@@ -614,6 +710,8 @@ def parse_games(data, timezone_name):
             "away": away.get("team", {}).get("displayName", "Away"),
             "home_id": str(home.get("team", {}).get("id", "")),
             "away_id": str(away.get("team", {}).get("id", "")),
+            "home_record": _extract_team_record(home.get("team", {})),
+            "away_record": _extract_team_record(away.get("team", {})),
             "home_logo": home.get("team", {}).get("logo", ""),
             "away_logo": away.get("team", {}).get("logo", ""),
             "away_conference": _pretty_conference(_extract_conference(away.get("team", {}))),
@@ -740,7 +838,7 @@ def get_game_watch_info(game_id):
     return _collect_watch_info(detail)
 
 
-def render_game(game, favorite=False, close=False, rankings=None):
+def render_game(game, favorite=False, close=False, rankings=None, records=None):
     status_badge = "🔴 LIVE" if game["state"] == "in" else ("FINAL" if game["state"] == "post" else "UPCOMING")
     meta = " • ".join(x for x in [
         status_badge,
@@ -758,8 +856,11 @@ def render_game(game, favorite=False, close=False, rankings=None):
     ranking_map = rankings or {}
     away_rank = ranking_map.get(_normalize_team_name(game["away"]))
     home_rank = ranking_map.get(_normalize_team_name(game["home"]))
-    away_label = f"#{away_rank} " if away_rank else ""
-    home_label = f"#{home_rank} " if home_rank else ""
+    record_map = records or {}
+    away_record = game.get("away_record") or record_map.get(_normalize_team_name(game["away"])) or record_map.get(f"id:{game.get('away_id', '')}")
+    home_record = game.get("home_record") or record_map.get(_normalize_team_name(game["home"])) or record_map.get(f"id:{game.get('home_id', '')}")
+    away_label = ((f"#{away_rank} " if away_rank else "") + (f"({away_record}) " if away_record else ""))
+    home_label = ((f"#{home_rank} " if home_rank else "") + (f"({home_record}) " if home_record else ""))
 
     if game["state"] in ("in", "post"):
         away_score, home_score = game["away_score"], game["home_score"]
@@ -895,129 +996,6 @@ def render_conference_standings(selected_sport, selected_conference=""):
     st.dataframe(clean, use_container_width=True, hide_index=True)
 
 
-def render_conference_rankings(selected_sport, selected_conference=""):
-    ranking_map = get_inline_ranking_maps().get(selected_sport, {})
-    if not ranking_map:
-        st.info("Rankings are not available for this sport.")
-        return
-    rows = []
-    # Use standings to attach conference names where possible.
-    standings = _standings_rows(get_standings_for_sport(selected_sport))
-    conf_by_team = {}
-    for r in standings:
-        name = r.get("Team") or r.get("School") or r.get("team") or r.get("school") or r.get("Name")
-        if name:
-            conf_by_team[_normalize_team_name(name)] = r.get("Conference", "")
-    for team, rank in ranking_map.items():
-        conf = conf_by_team.get(team, "")
-        if selected_conference and _normalize_team_name(conf) != _normalize_team_name(selected_conference):
-            continue
-        rows.append({"Rank": int(rank) if str(rank).isdigit() else rank, "Team": team.title(), "Conference": conf or "Unknown"})
-    rows.sort(key=lambda r: int(r["Rank"]) if str(r["Rank"]).isdigit() else 999)
-    if rows:
-        st.dataframe(rows, use_container_width=True, hide_index=True)
-    else:
-        st.info("No ranked teams were found for the selected conference.")
-
-
-@st.fragment(run_every="30s")
-def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, conference_filter, top25_only, date_offset, live_only, favorites_only, standings_sport, standings_conference):
-    st.title("🏆 College Sports Live")
-    selected_date = today_in_timezone(selected_timezone) + timedelta(days=date_offset)
-    date_label = { -1: "Yesterday", 0: "Today", 1: "Tomorrow" }.get(date_offset, str(selected_date))
-    st.caption(f"NCAA college scores • {date_label} • Showing times in {timezone_label}")
-
-    try:
-        data = get_all_scoreboards(selected_timezone, selected_date)
-        games = parse_games(data, selected_timezone)
-    except Exception as exc:
-        st.error(f"Could not retrieve scores: {type(exc).__name__}: {exc}")
-        st.stop()
-
-    all_games_for_alerts = list(games)
-    flashes = update_score_alerts(all_games_for_alerts)
-    if flashes:
-        inject_flash_css()
-        names = " • ".join(_game_label(g) for g in flashes[:4])
-        st.markdown(f'<div class="scoreboard-flash">🚨 SCORE ALERT 🚨<br>{names}</div>', unsafe_allow_html=True)
-
-    if show_diagnostics:
-        with st.expander("🛠️ Scoreboard Diagnostics", expanded=True):
-            st.write({"selected_time_zone": timezone_label, "selected_date": str(selected_date), "raw_combined_event_count": len(data.get("events", [])), "parsed_game_count": len(games), "errors": data.get("errors", [])})
-            for diag in data.get("diagnostics", []):
-                with st.container(border=True):
-                    st.markdown(f"**{diag.get('sport','Unknown sport')}**")
-                    st.write({k:v for k,v in diag.items() if k not in {"sample_games"}})
-                    if diag.get("sample_games"): st.json(diag["sample_games"][:10])
-
-    selected = set(sport_filter)
-    if selected:
-        games = [g for g in games if g["sport"] in selected]
-
-    ranking_maps = get_inline_ranking_maps()
-    if conference_filter:
-        selected_conferences = set(conference_filter)
-        games = [g for g in games if g.get("away_conference") in selected_conferences or g.get("home_conference") in selected_conferences]
-    if top25_only:
-        games = [g for g in games if ranking_maps.get(g["sport"], {}).get(_normalize_team_name(g["away"])) or ranking_maps.get(g["sport"], {}).get(_normalize_team_name(g["home"]))]
-
-    favorites = st.session_state.favorites
-    if live_only:
-        games = [g for g in games if g["state"] == "in"]
-    if favorites_only:
-        games = [g for g in games if is_favorite(g, favorites)]
-
-    live_games = [g for g in games if g["state"] == "in"]
-    close_games = [g for g in live_games if g["diff"] < threshold]
-    favorite_games = [g for g in games if is_favorite(g, favorites)]
-    live_sorted = sorted(live_games, key=lambda g: (g["diff"], g["event_time"] or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone))))
-    final_sorted = sorted([g for g in games if g["state"] == "post"], key=lambda g: g["event_time"] or datetime.min.replace(tzinfo=ZoneInfo(selected_timezone)), reverse=True)
-    upcoming_today = sorted([g for g in games if g["state"] == "pre"], key=lambda g: g["event_time"] or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone)))
-
-    c1,c2,c3,c4,c5 = st.columns(5)
-    c1.metric("🔴 Live", len(live_games)); c2.metric(f"🔥 Under {threshold}", len(close_games)); c3.metric("⭐ My Teams", len(favorite_games)); c4.metric("🏆 Games", len(games)); c5.metric("🔔 Alerts", sum(bool(st.session_state.get(_alert_key(g["id"]), False)) for g in all_games_for_alerts))
-
-    st.markdown("---")
-    st.subheader("⭐ My Teams")
-    if favorite_games:
-        for favorite_name, favorite_id in favorites.items():
-            team_games = [g for g in games if is_favorite(g, {favorite_name: favorite_id})]
-            st.markdown(f"### ⭐ {favorite_name}")
-            if not team_games: st.caption("No games found for this date.")
-            else:
-                for game in sorted(team_games, key=lambda g: (g["state"] != "in", g["event_time"] or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone)))):
-                    alert = bool(st.session_state.get(_alert_key(game["id"]), False))
-                    st.caption("🔔 Flash alert enabled" if alert else "")
-                    render_game({**game, "_render_context":"myteams"}, favorite=True, close=(game["state"]=="in" and game["diff"]<threshold), rankings=ranking_maps.get(game["sport"], {}))
-    else:
-        st.info("Select teams in the sidebar to build your My Teams dashboard.")
-
-    st.markdown("---")
-    st.subheader("🏆 Games — Sorted by Closeness")
-    for game in live_sorted + final_sorted:
-        context = "main"
-        render_alert_toggle(game, context)
-        render_game({**game, "_render_context":context}, favorite=is_favorite(game, favorites), close=(game["state"]=="in" and game["diff"]<threshold), rankings=ranking_maps.get(game["sport"], {}))
-    if not (live_sorted or final_sorted): st.info("No live or completed games match the current filters.")
-
-    st.markdown("---")
-    st.subheader("📅 Upcoming")
-    if not upcoming_today: st.info("No upcoming games match the current filters.")
-    for game in upcoming_today:
-        render_alert_toggle(game, "upcoming")
-        render_game({**game, "_render_context":"upcoming"}, favorite=is_favorite(game, favorites), close=False, rankings=ranking_maps.get(game["sport"], {}))
-
-    st.markdown("---")
-    st.subheader("📊 Conference Tools")
-    tab1, tab2 = st.tabs(["🏆 Conference Standings", "📈 Conference Rankings"])
-    with tab1:
-        st.caption("NCAA conference standings for the selected sport.")
-        render_conference_standings(standings_sport, standings_conference)
-    with tab2:
-        st.caption("Ranked teams grouped by conference when NCAA standings provide the conference mapping.")
-        render_conference_rankings(standings_sport, standings_conference)
-
-
 # Sidebar controls
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -1045,7 +1023,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("📊 Conference Tools")
-    standings_sport = st.selectbox("Sport for standings/rankings", list(SPORTS.keys()), index=0)
+    standings_sport = st.selectbox("Sport for standings", list(SPORTS.keys()), index=0)
     standings_conference = st.selectbox("Conference", ["All conferences"] + conference_options, index=0)
     if standings_conference == "All conferences": standings_conference = ""
 
