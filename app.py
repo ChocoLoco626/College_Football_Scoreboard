@@ -55,6 +55,13 @@ st.markdown("""
 .myteam-opponent { font-size:13px; margin-top:4px; }
 .history-row { border-bottom:1px solid rgba(128,128,128,.18); padding:7px 0; font-size:13px; }
 .history-time { color:#9ca3af; font-size:11px; }
+.score-change { font-size:12px; font-weight:800; margin-left:8px; }
+.countdown { font-weight:800; }
+.compact-game-card { padding:9px 12px; margin:5px 0; }
+.compact-game-card .team { font-size:16px; margin:5px 0; min-height:30px; }
+.compact-game-card .score { font-size:25px; }
+.compact-game-card .meta { font-size:11px; }
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -973,7 +980,31 @@ def _live_status_text(game):
     return f"{label} • {clock}" if clock else label
 
 
-def render_game(game, favorite=False, close=False, rankings=None, records=None):
+def _recent_score_change(game):
+    """Return a small score-change label for a game changed on the latest refresh."""
+    item = st.session_state.get("recent_score_changes", {}).get(str(game.get("id")))
+    return item.get("label", "") if item else ""
+
+
+def _upcoming_countdown(event_time):
+    """Return a friendly countdown for an upcoming game."""
+    if not event_time:
+        return ""
+    now = datetime.now(event_time.tzinfo)
+    seconds = int((event_time - now).total_seconds())
+    if seconds <= 0:
+        return "Starting now"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"Starts in {minutes} min"
+    hours, mins = divmod(minutes, 60)
+    if hours < 24:
+        return f"Starts in {hours}h {mins:02d}m" if mins else f"Starts in {hours}h"
+    days, rem = divmod(hours, 24)
+    return f"Starts in {days}d {rem}h"
+
+
+def render_game(game, favorite=False, close=False, rankings=None, records=None, compact=False):
     status_badge = "🔴 LIVE NOW" if game["state"] == "in" else ("FINAL" if game["state"] == "post" else "UPCOMING")
     live_detail = _live_status_text(game)
     meta = " • ".join(x for x in [
@@ -1008,15 +1039,23 @@ def render_game(game, favorite=False, close=False, rankings=None, records=None):
         clock = f" • Period {game['period']} • {game['clock']}" if game["clock"] else f" • Period {game['period']}"
 
     start_time = ""
+    countdown = ""
     if game.get("event_time") and game["state"] == "pre":
         start_time = game["event_time"].strftime("%I:%M %p %Z").lstrip("0")
+        countdown = _upcoming_countdown(game["event_time"])
 
+    change_label = _recent_score_change(game)
+    change_html = f'<span class="score-change">{change_label}</span>' if change_label else ""
+    start_meta = f" • Start: {start_time}" if start_time else ""
+    if countdown:
+        start_meta += f' • <span class="countdown">{countdown}</span>'
+    card_class = "game-card compact-game-card" if compact else "game-card"
     st.markdown(f"""
-    <div class="game-card">
+    <div class="{card_class}">
       <div class="meta">{game['sport']} • {meta}</div>
-      <div class="team">{away_logo}{away_label}{game['away']}<span class="score">{away_score}</span></div>
-      <div class="team">{home_logo}{home_label}{game['home']}<span class="score">{home_score}</span></div>
-      <div class="meta">Score difference: {game['diff']}{clock}{(' • Start: ' + start_time) if start_time else ''}</div>
+      <div class="team">{away_logo}{away_label}@ {game['away']}<span class="score">{away_score}</span></div>
+      <div class="team">{home_logo}{home_label}🏠 {game['home']}<span class="score">{home_score}</span></div>
+      <div class="meta">Score difference: {game['diff']}{change_html}{clock}{start_meta}</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1075,6 +1114,7 @@ def update_score_history(all_games, timezone_name, max_entries=12):
     history = st.session_state.setdefault("score_change_history", [])
     current = {}
     changes = []
+    recent_changes = {}
 
     for game in all_games:
         gid = str(game.get("id") or "")
@@ -1100,7 +1140,7 @@ def update_score_history(all_games, timezone_name, max_entries=12):
                 change = f"Score changed to {snapshot[0]}–{snapshot[1]}"
             else:
                 change = "Game status changed"
-            changes.append({
+            change_item = {
                 "game_id": gid,
                 "away": game.get("away", "Away"),
                 "home": game.get("home", "Home"),
@@ -1109,12 +1149,26 @@ def update_score_history(all_games, timezone_name, max_entries=12):
                 "away_score": snapshot[0],
                 "home_score": snapshot[1],
                 "timestamp": datetime.now(ZoneInfo(timezone_name)).strftime("%I:%M:%S %p").lstrip("0"),
-            })
+            }
+            changes.append(change_item)
+            if snapshot[0] != old[0] or snapshot[1] != old[1]:
+                try:
+                    away_delta = int(snapshot[0]) - int(old[0])
+                    home_delta = int(snapshot[1]) - int(old[1])
+                except (TypeError, ValueError):
+                    away_delta = home_delta = 0
+                if away_delta and not home_delta:
+                    recent_changes[gid] = {"label": f"▲ {game.get('away','Away')} +{away_delta}"}
+                elif home_delta and not away_delta:
+                    recent_changes[gid] = {"label": f"▲ {game.get('home','Home')} +{home_delta}"}
+                else:
+                    recent_changes[gid] = {"label": "▲ Score changed"}
 
     if changes:
         history = changes + history
         st.session_state.score_change_history = history[:max_entries]
     st.session_state.previous_game_snapshots = current
+    st.session_state.recent_score_changes = recent_changes
     return st.session_state.score_change_history
 
 
@@ -1204,7 +1258,7 @@ def render_conference_standings(selected_sport, selected_conference=""):
 
 
 @st.fragment(run_every="30s")
-def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, conference_filter, top25_only, date_offset, live_only, favorites_only):
+def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, conference_filter, top25_only, date_offset, live_only, favorites_only, compact_mode):
     st.title("🏆 College Sports Live")
     selected_date = today_in_timezone(selected_timezone) + timedelta(days=date_offset)
     if date_offset == 0:
@@ -1370,12 +1424,24 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, c
                         favorite_game_record = game.get("home_record") if is_home else game.get("away_record")
                         favorite_game_record = favorite_game_record or favorite_record
 
+                        result_prefix = ""
                         if game["state"] == "in":
                             status = "🔴 LIVE"
                             score = f'{game["home_score"]}–{game["away_score"]}'
                         elif game["state"] == "post":
                             status = "FINAL"
                             score = f'{game["home_score"]}–{game["away_score"]}'
+                            fav_score = game["home_score"] if is_home else game["away_score"]
+                            opp_score = game["away_score"] if is_home else game["home_score"]
+                            try:
+                                if int(fav_score) > int(opp_score):
+                                    result_prefix = "✅ WIN"
+                                elif int(fav_score) < int(opp_score):
+                                    result_prefix = "❌ LOSS"
+                                else:
+                                    result_prefix = "➖ TIE"
+                            except (TypeError, ValueError):
+                                pass
                         else:
                             status = game.get("event_time").strftime("%I:%M %p").lstrip("0") if game.get("event_time") else "UPCOMING"
                             score = "—"
@@ -1387,7 +1453,7 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, c
                         opponent_label = f"{opponent}{f' ({opponent_record})' if opponent_record else ''}"
                         game_rows.append(
                             f'<div class="myteam-game-row">'
-                            f'<div class="myteam-status">{status}{alert_text} • {game["sport"]}</div>'
+                            f'<div class="myteam-status">{result_prefix + " • " if result_prefix else ""}{status}{alert_text} • {game["sport"]}</div>'
                             f'<div class="myteam-score">{score}</div>'
                             f'<div class="myteam-opponent">{favorite_team_label} {result_text} {opponent_label}</div>'
                             f'</div>'
@@ -1410,7 +1476,7 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, c
     for i, game in enumerate(live_sorted + final_sorted):
         context = "main"
         render_alert_toggle(game, context, i)
-        render_game({**game, "_render_context":context}, favorite=is_favorite(game, favorites), close=(game["state"]=="in" and game["diff"]<threshold), rankings=ranking_maps.get(game["sport"], {}), records=record_maps.get(game["sport"], {}))
+        render_game({**game, "_render_context":context}, favorite=is_favorite(game, favorites), close=(game["state"]=="in" and game["diff"]<threshold), rankings=ranking_maps.get(game["sport"], {}), records=record_maps.get(game["sport"], {}), compact=compact_mode)
     if not (live_sorted or final_sorted): st.info("No live or completed games match the current filters.")
 
     st.markdown("---")
@@ -1418,7 +1484,7 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, c
     if not upcoming_today: st.info("No upcoming games match the current filters.")
     for i, game in enumerate(upcoming_today):
         render_alert_toggle(game, "upcoming", i)
-        render_game({**game, "_render_context":"upcoming"}, favorite=is_favorite(game, favorites), close=False, rankings=ranking_maps.get(game["sport"], {}), records=record_maps.get(game["sport"], {}))
+        render_game({**game, "_render_context":"upcoming"}, favorite=is_favorite(game, favorites), close=False, rankings=ranking_maps.get(game["sport"], {}), records=record_maps.get(game["sport"], {}), compact=compact_mode)
 
 
 # Sidebar controls
@@ -1445,6 +1511,7 @@ with st.sidebar:
     live_only = st.checkbox("🔴 Live games only", value=False)
     favorites_only = st.checkbox("⭐ My Teams only", value=False)
     threshold = st.slider("Close-game threshold", min_value=1, max_value=20, value=7)
+    compact_mode = st.checkbox("📱 Compact scoreboard", value=False, help="Tighten cards and spacing so more games fit on screen.")
 
     st.markdown("---")
     st.subheader("⭐ Favorite Teams")
@@ -1464,5 +1531,5 @@ with st.sidebar:
         get_all_scoreboards.clear()
         st.rerun()
 
-live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, conference_filter, top25_only, date_offset, live_only, favorites_only)
+live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, conference_filter, top25_only, date_offset, live_only, favorites_only, compact_mode)
 
