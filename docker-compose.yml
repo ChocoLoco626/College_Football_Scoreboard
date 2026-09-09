@@ -1,0 +1,7 @@
+services:
+  scoreboard:
+    build: .
+    container_name: college-football-scoreboard
+    ports:
+      - "8501:8501"
+    restart: unless-stopped

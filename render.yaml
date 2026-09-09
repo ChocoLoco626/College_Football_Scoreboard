@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: college-football-scoreboard
+    env: docker
+    plan: free
+    healthCheckPath: /_stcore/health

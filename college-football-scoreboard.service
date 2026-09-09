@@ -1,0 +1,15 @@
+[Unit]
+Description=College Football Streamlit Scoreboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=%h/college_football_scoreboard
+ExecStart=%h/college_football_scoreboard/.venv/bin/streamlit run %h/college_football_scoreboard/app.py --server.address=0.0.0.0 --server.port=8501 --server.headless=true
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
