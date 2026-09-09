@@ -378,10 +378,36 @@ def _extract_volleyball_set_scores(payload, away_id="", home_id=""):
     return []
 
 
+def _ncaa_football_week(target_date):
+    """Return the NCAA football scoreboard week containing target_date.
+
+    NCAA's football scoreboard API is week-based (YYYY/WK), unlike the
+    date-based routes used by most other sports. The first regular-season
+    week can span two calendar weeks because of Labor Day weekend, so use
+    the first two Thursdays of the season as the boundary.
+    """
+    year = target_date.year
+    # NCAA football normally begins on the last Thursday of August. Week 1
+    # runs through the Wednesday before the following Thursday (the long
+    # Labor Day opening week); subsequent weeks are seven days each.
+    aug31 = date(year, 8, 31)
+    first_thursday = aug31 - timedelta(days=(aug31.weekday() - 3) % 7)
+    if target_date < first_thursday:
+        return 0
+    second_thursday = first_thursday + timedelta(days=14)
+    if target_date < second_thursday:
+        return 1
+    return 2 + ((target_date - second_thursday).days // 7)
+
+
 def get_ncaa_scoreboard(sport_slug, division, sport_name, timezone_name, target_date=None):
-    """Fetch a dated NCAA scoreboard and normalize it to our app format."""
+    """Fetch an NCAA scoreboard and normalize it to our app format."""
     local_date = target_date or today_in_timezone(timezone_name)
-    date_path = local_date.strftime("%Y/%m/%d")
+    if sport_slug == "football":
+        week = _ncaa_football_week(local_date)
+        date_path = f"{local_date.year}/{week:02d}/all-conf"
+    else:
+        date_path = local_date.strftime("%Y/%m/%d")
     url = f"https://ncaa-api.henrygd.me/scoreboard/{sport_slug}/{division}/{date_path}"
 
     response = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
@@ -530,9 +556,9 @@ NCAA_SPORTS = {
 def get_all_scoreboards(timezone_name, target_date=None):
     """Fetch NCAA scoreboards for a selected local calendar date.
 
-    NCAA's football feed can occasionally place a late-evening ET game on the
-    following UTC calendar date. For football only, we also inspect the next
-    NCAA calendar date so the game still appears on the correct local date.
+    Football is fetched by NCAA week, then the dashboard filters games by the
+    actual local event date. This is important because the NCAA football API
+    uses YYYY/WK routes rather than YYYY/MM/DD routes.
     """
     combined = []
     errors = []
@@ -541,9 +567,11 @@ def get_all_scoreboards(timezone_name, target_date=None):
 
     for sport_name, configs in NCAA_SPORTS.items():
         for sport_slug, division in configs:
+            # Football endpoints are week-based; get_ncaa_scoreboard()
+            # resolves the selected date to the correct NCAA week. Do not
+            # fetch target_date + 1 separately because that can return the
+            # same week twice.
             dates_to_fetch = [target_date]
-            if sport_slug == "football":
-                dates_to_fetch.append(target_date + timedelta(days=1))
             seen_ids = set()
             for fetch_date in dates_to_fetch:
                 try:
@@ -1169,7 +1197,7 @@ with st.sidebar:
     st.session_state.favorites = {name: TEAM_IDS[name] for name in selected_favorites}
 
     st.markdown("---")
-    st.subheader("📊 Conference Tools")
+    st.subheader("📊 Standings")
     standings_sport = st.selectbox("Sport for standings", list(SPORTS.keys()), index=0)
     standings_conference = st.selectbox("Conference", ["All conferences"] + conference_options, index=0)
     if standings_conference == "All conferences": standings_conference = ""
