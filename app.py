@@ -1742,12 +1742,24 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, c
     with st.expander("📈 Score Change History", expanded=False):
         render_score_history(history)
 
-    st.subheader("🏆 Games — Sorted by Closeness")
-    for i, game in enumerate(live_sorted + final_sorted):
+    st.subheader("🔥 Close Games")
+    close_sorted = sorted(close_games, key=lambda g: (g["diff"], g.get("event_time") or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone))))
+    if not close_sorted:
+        st.info("No close live games match the current filters.")
+    for i, game in enumerate(close_sorted):
         context = "main"
         render_alert_toggle(game, context, i)
-        render_game({**game, "_render_context":context}, favorite=is_favorite(game, favorites), close=(game["state"]=="in" and game["diff"]<threshold), rankings=ranking_maps.get(game["sport"], {}), records=record_maps.get(game["sport"], {}), compact=compact_mode)
-    if not (live_sorted or final_sorted): st.info("No live or completed games match the current filters.")
+        render_game({**game, "_render_context":context}, favorite=is_favorite(game, favorites), close=True, rankings=ranking_maps.get(game["sport"], {}), records=record_maps.get(game["sport"], {}), compact=compact_mode)
+
+    st.markdown("---")
+    st.subheader("🏁 Final")
+    if not final_sorted:
+        st.info("No final games match the current filters.")
+    final_start = len(close_sorted)
+    for i, game in enumerate(final_sorted):
+        context = "main"
+        render_alert_toggle(game, context, final_start + i)
+        render_game({**game, "_render_context":context}, favorite=is_favorite(game, favorites), close=False, rankings=ranking_maps.get(game["sport"], {}), records=record_maps.get(game["sport"], {}), compact=compact_mode)
 
     st.markdown("---")
     st.subheader("📅 Upcoming")
