@@ -428,7 +428,16 @@ def get_ncaa_scoreboard(sport_slug, division, sport_name, timezone_name, target_
             start_time = game.get("startTime") or ""
             if isinstance(start_date, str) and isinstance(start_time, str) and start_time.strip():
                 import re
-                text = start_time.strip().replace(" ET", "").replace(" EST", "").replace(" EDT", "")
+                raw_time = start_time.strip()
+                # The NCAA football feed can return a UTC calendar date in
+                # startDate while startTime is explicitly labeled ET. For a
+                # date-scoped request, the requested local date is the source
+                # of truth in this fallback case. Otherwise a Thursday night
+                # game can arrive as Friday in UTC and get filtered out.
+                explicit_eastern = bool(re.search(r"\b(?:ET|EST|EDT)\b", raw_time, re.I))
+                if explicit_eastern and target_date is not None:
+                    start_date = local_date.isoformat()
+                text = raw_time.replace(" ET", "").replace(" EST", "").replace(" EDT", "")
                 match = re.match(r"^(\d{1,2}:\d{2})\s*(AM|PM)?", text, re.I)
                 if match:
                     clock = match.group(1)
