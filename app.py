@@ -22,7 +22,7 @@ SPORTS = {
     "⚽ Women's Soccer": [("soccer", "womens-college-soccer", "NCAA", 50)],
     "🏀 Men's Basketball": [("basketball", "mens-college-basketball", "NCAA", 50)],
     "🏀 Women's Basketball": [("basketball", "womens-college-basketball", "NCAA", 50)],
-    "🏐 Women's Volleyball": [("volleyball", "womens-college-volleyball", "NCAA", 50)],
+    "🏐 Women's Volleyball": [("volleyball", "womens-college-volleyball", "NCAA", None)],
     "⚾ Baseball": [("baseball", "college-baseball", "NCAA", 50)],
     "🥎 Softball": [("softball", "college-softball", "NCAA", 50)],
 }
@@ -70,8 +70,16 @@ def get_scoreboard(sport, league, group=None, timezone_name=TIMEZONES[DEFAULT_TI
     window_str = f"{today_str}-{tomorrow.strftime('%Y%m%d')}"
 
     base_params = {"limit": 1000}
+
+    # Most NCAA scoreboards benefit from groups=50, but ESPN's women's
+    # volleyball feed is more reliable without that filter.  We therefore
+    # try both forms whenever a group was supplied, merging the results.
+    request_variants = []
     if group is not None:
-        base_params["groups"] = str(group)
+        request_variants.append({"limit": 1000, "groups": str(group)})
+        request_variants.append({"limit": 1000})
+    else:
+        request_variants.append({"limit": 1000})
 
     # ESPN's college volleyball feed can be inconsistent about which calendar
     # date is returned for events near midnight/time-zone boundaries. Fetch a
@@ -85,24 +93,25 @@ def get_scoreboard(sport, league, group=None, timezone_name=TIMEZONES[DEFAULT_TI
     merged_events = {}
     last_data = {"events": []}
     for date_value in date_windows:
-        params = {**base_params, "dates": date_value}
-        response = requests.get(
-            url, params=params, timeout=12,
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        response.raise_for_status()
-        data = response.json()
-        last_data = data
-        for event in data.get("events", []):
-            event_id = str(event.get("id", ""))
-            if event_id:
-                merged_events[event_id] = event
+        for variant in request_variants:
+            params = {**variant, "dates": date_value}
+            response = requests.get(
+                url, params=params, timeout=12,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            response.raise_for_status()
+            data = response.json()
+            last_data = data
+            for event in data.get("events", []):
+                event_id = str(event.get("id", ""))
+                if event_id:
+                    merged_events[event_id] = event
 
     # Final fallback: ESPN's default scoreboard date. Some college feeds can
     # temporarily return a sparse dated response, especially volleyball.
     if not merged_events:
         response = requests.get(
-            url, params=base_params, timeout=12,
+            url, params={"limit": 1000}, timeout=12,
             headers={"User-Agent": "Mozilla/5.0"},
         )
         response.raise_for_status()
