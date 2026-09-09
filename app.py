@@ -339,9 +339,29 @@ def _extract_volleyball_set_scores(payload, away_id="", home_id=""):
     # a list. We inspect several naming variants because the upstream GraphQL
     # schema has changed between API releases.
     candidate_keys = {
-        "sets", "setsscores", "setscores", "periods", "periodscores",
-        "linescores", "linescore", "linescores", "periodscores",
+        "sets", "setsscores", "setscores", "setscore", "periods", "periodscores",
+        "periodscore", "linescores", "linescore", "scoresbyset", "scorebyset",
+        "scoresbyperiod", "scorebyperiod", "periodscores",
     }
+
+    def parse_score_pair(value):
+        """Parse a volleyball period score represented as a pair/string/list."""
+        if isinstance(value, str):
+            import re
+            m = re.search(r"(\d+)\s*[-–:]\s*(\d+)", value)
+            if m:
+                return int(m.group(1)), int(m.group(2))
+        if isinstance(value, (list, tuple)) and len(value) >= 2:
+            a, h = _first_number(value[0]), _first_number(value[1])
+            if a is not None and h is not None:
+                return a, h
+        if isinstance(value, dict):
+            a = value.get("away", value.get("awayScore", value.get("away_score")))
+            h = value.get("home", value.get("homeScore", value.get("home_score")))
+            a, h = _first_number(a), _first_number(h)
+            if a is not None and h is not None:
+                return a, h
+        return None
 
     def key_norm(k):
         return str(k).lower().replace("_", "").replace("-", "")
@@ -354,15 +374,22 @@ def _extract_volleyball_set_scores(payload, away_id="", home_id=""):
             rows = []
             for idx, row in enumerate(value):
                 if not isinstance(row, dict):
+                    pair = parse_score_pair(row)
+                    if pair:
+                        rows.append({"Set": str(idx + 1), "Away": pair[0], "Home": pair[1]})
                     continue
                 label = row.get("name") or row.get("label") or row.get("period") or row.get("set") or row.get("number") or idx + 1
                 away = row.get("awayScore", row.get("away_score"))
                 home = row.get("homeScore", row.get("home_score"))
                 if away is None or home is None:
-                    scores = row.get("scores") or row.get("score")
+                    scores = row.get("scores") or row.get("score") or row.get("setScore") or row.get("periodScore")
                     if isinstance(scores, dict):
                         away = scores.get("away", scores.get(str(away_id)))
                         home = scores.get("home", scores.get(str(home_id)))
+                    else:
+                        pair = parse_score_pair(scores)
+                        if pair:
+                            away, home = pair
                 if away is not None and home is not None:
                     a, h = _first_number(away), _first_number(home)
                     if a is not None and h is not None:
@@ -391,6 +418,11 @@ def _extract_volleyball_set_scores(payload, away_id="", home_id=""):
             for row in value:
                 if isinstance(row, dict):
                     raw = row.get("score", row.get("points", row.get("value")))
+                    pair = parse_score_pair(raw)
+                    if pair:
+                        # A paired score belongs to the row-level parser above;
+                        # do not treat it as a single team's value here.
+                        continue
                     n = _first_number(raw)
                     if n is not None:
                         vals.append(n)
