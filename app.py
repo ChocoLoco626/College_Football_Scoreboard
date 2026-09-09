@@ -465,6 +465,18 @@ def get_volleyball_set_info(game_id, away_id="", home_id=""):
     return None
 
 
+def _volleyball_set_score_text(game):
+    """Return volleyball set result plus points for each set, e.g. 3–1 • 25–21, 25–23, 20–25, 25–18."""
+    if game.get("sport") != "🏐 Women's Volleyball":
+        return ""
+    away_sets = game.get("away_score", "—")
+    home_sets = game.get("home_score", "—")
+    away_points = game.get("away_points_by_set") or []
+    home_points = game.get("home_points_by_set") or []
+    pairs = [f"{a}–{h}" for a, h in zip(away_points, home_points)]
+    return f"{away_sets}–{home_sets}" + (f" • " + ", ".join(pairs) if pairs else "")
+
+
 def _volleyball_score_label(game, side):
     """Format volleyball as sets first, then the points won in each set."""
     sets = game.get(f"{side}_score")
@@ -873,7 +885,7 @@ NCAA_SPORTS = {
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def _get_cached_scoreboard_snapshot(timezone_name, target_date):
+def _get_cached_scoreboard_snapshot(timezone_name, target_date, selected_sports=()):
     """Build a relatively stable slate snapshot for the selected date.
 
     Upcoming and completed games live here for 30 minutes. Live score polling
@@ -885,8 +897,13 @@ def _get_cached_scoreboard_snapshot(timezone_name, target_date):
     errors = []
     diagnostics = []
     target_date = target_date or today_in_timezone(timezone_name)
+    selected_sports = tuple(selected_sports or ())
+    if not selected_sports:
+        return {"events": [], "errors": [], "diagnostics": [], "cached_at": datetime.now(ZoneInfo(timezone_name)).isoformat()}
 
     for sport_name, configs in NCAA_SPORTS.items():
+        if sport_name not in selected_sports:
+            continue
         for sport_slug, division in configs:
             if sport_slug == "football":
                 dates_to_fetch = [target_date]
@@ -961,24 +978,31 @@ def _event_is_live_candidate(event, now_local):
     return False
 
 
-def get_all_scoreboards(timezone_name, target_date=None):
-    """Return a cached slate plus live updates only for active games.
+def get_all_scoreboards(timezone_name, target_date=None, selected_sports=()):
+    """Return a cached slate plus live updates only for selected active games.
 
-    This is the key performance optimization: future games and already-final
-    games are served from the 30-minute snapshot. Every 30-second fragment
-    refresh only re-requests NCAA scoreboard feeds for sport/division feeds
-    containing a game that is live or whose scheduled start time has passed.
+    Upcoming/final games are held in a 30-minute snapshot. Every 30-second
+    refresh only polls feeds for selected sports that contain a live game or
+    a game whose scheduled start time has passed. If no sport is selected, no
+    NCAA score requests are made.
     """
     target_date = target_date or today_in_timezone(timezone_name)
-    snapshot = _get_cached_scoreboard_snapshot(timezone_name, target_date)
+    selected_sports = tuple(s for s in (selected_sports or ()) if s in NCAA_SPORTS)
+    if not selected_sports:
+        return {
+            "events": [], "errors": [], "diagnostics": [],
+            "fetched_at": datetime.now(ZoneInfo(timezone_name)).isoformat(),
+            "snapshot_cached_at": None,
+        }
+
+    snapshot = _get_cached_scoreboard_snapshot(timezone_name, target_date, selected_sports)
     combined = list(snapshot.get("events", []))
     errors = list(snapshot.get("errors", []))
     diagnostics = list(snapshot.get("diagnostics", []))
     now_local = datetime.now(ZoneInfo(timezone_name))
 
-    # Group the cached events by exact NCAA sport/division configuration so we
-    # can poll only the feeds that currently contain an active game.
-    for sport_name, configs in NCAA_SPORTS.items():
+    for sport_name in selected_sports:
+        configs = NCAA_SPORTS.get(sport_name, [])
         for sport_slug, division in configs:
             candidates = [
                 event for event in combined
@@ -989,7 +1013,6 @@ def get_all_scoreboards(timezone_name, target_date=None):
             if not candidates:
                 continue
 
-            # Poll the same date pages used by the original snapshot logic.
             if sport_slug == "football":
                 dates_to_fetch = [target_date]
             elif timezone_name == "America/Chicago":
@@ -1023,9 +1046,6 @@ def get_all_scoreboards(timezone_name, target_date=None):
                     errors.append(f"{sport_name} ({sport_slug}/{division}, {fetch_date}): {type(exc).__name__}: {exc}")
 
             if refreshed:
-                # Replace only events belonging to this sport/division. Any
-                # future/final games missing from the refreshed feed remain in
-                # the cached snapshot instead of disappearing from the UI.
                 refreshed_by_id = {str(e.get("id")): e for e in refreshed if e.get("id")}
                 new_combined = []
                 for event in combined:
@@ -1037,16 +1057,14 @@ def get_all_scoreboards(timezone_name, target_date=None):
                             new_combined.append(event)
                     else:
                         new_combined.append(event)
-                # Add genuinely new events discovered by the live poll.
                 new_combined.extend(refreshed_by_id.values())
                 combined = new_combined
 
-    fetched_at = datetime.now(ZoneInfo(timezone_name)).isoformat()
     return {
         "events": combined,
         "errors": errors,
         "diagnostics": diagnostics,
-        "fetched_at": fetched_at,
+        "fetched_at": datetime.now(ZoneInfo(timezone_name)).isoformat(),
         "snapshot_cached_at": snapshot.get("cached_at"),
     }
 
@@ -1572,6 +1590,7 @@ def render_game(game, favorite=False, close=False, rankings=None, records=None, 
       <div class="meta">{game['sport']} • {meta}{matchup_meta}</div>
       <div class="team">{away_logo}{away_label}{game['away']} ✈️<span class="score">{away_score}</span></div>
       <div class="team">{home_logo}{home_label}{game['home']} 🏠<span class="score">{home_score}</span></div>
+      {f'<div class="meta">🏐 Set score: {_volleyball_set_score_text(game)}</div>' if game.get("sport") == "🏐 Women's Volleyball" and (game.get("away_points_by_set") or game.get("home_points_by_set")) else ''}
       <div class="meta">Score difference: {game['diff']}{' set' if game.get('sport') == "🏐 Women's Volleyball" and game['diff'] == 1 else (' sets' if game.get('sport') == "🏐 Women's Volleyball" else '')}{change_html}{clock}{start_meta}</div>
     </div>
     """, unsafe_allow_html=True)
@@ -1790,7 +1809,7 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, close_thresh
 
     try:
         refresh_started = time.perf_counter()
-        data = get_all_scoreboards(selected_timezone, selected_date)
+        data = get_all_scoreboards(selected_timezone, selected_date, sport_filter)
         refresh_duration = time.perf_counter() - refresh_started
         games = parse_games(data, selected_timezone)
         games = dedupe_games(games)
@@ -2049,7 +2068,7 @@ with st.sidebar:
     )
     date_offset = (selected_game_date - today_local).days
 
-    sport_filter = st.multiselect("Sports", list(SPORTS.keys()), default=list(SPORTS.keys()))
+    sport_filter = st.multiselect("Sports", list(SPORTS.keys()), default=[], help="Select a sport to load its scores. Leaving this empty makes no NCAA score requests, which keeps the dashboard fast.")
     conference_options = ["ACC","AAC","America East","Atlantic 10","ASUN","Big 12","Big East","Big Sky","Big South","Big Ten","Big West","CAA","C-USA","Horizon League","Ivy League","MAAC","MAC","MEAC","Missouri Valley","Mountain West","NEC","Ohio Valley","Pac-12","Patriot League","SEC","SoCon","Southland","Summit League","Sun Belt","SWAC","WAC","WCC","West Coast","Independent"]
     conference_filter = st.multiselect("🏟️ Conferences", conference_options, default=[])
     top25_only = st.checkbox("🏆 Top 25 teams only", value=False)
@@ -2092,8 +2111,10 @@ with st.sidebar:
 
     st.caption("Scores refresh quietly every 30 seconds. Manual refresh only refreshes the NCAA score feeds, leaving rankings and logos cached.")
     if st.button("🔄 Refresh now", use_container_width=True):
-        get_all_scoreboards.clear()
+        _get_cached_scoreboard_snapshot.clear()
         st.rerun()
 
+if not sport_filter:
+    st.info("Select one or more sports in the sidebar to load scores. No score feeds are requested until you choose a sport.")
 live_dashboard(timezone_label, selected_timezone, sport_filter, close_thresholds, conference_filter, top25_only, date_offset, live_only, favorites_only, compact_mode)
 
