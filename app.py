@@ -55,7 +55,86 @@ def _ncaa_logo_url(team_names):
     if not isinstance(team_names, dict):
         return ""
     slug = team_names.get("seo") or team_names.get("team_seo") or team_names.get("slug")
-    return f"https://ncaa-api.henrygd.me/logo/{slug}.svg" if slug else ""
+    if not slug:
+        return ""
+    return f"https://ncaa-api.henrygd.me/logo/{slug}.svg?dark=true"
+
+
+RANKING_CONFIGS = {
+    "🏈 Football (AP Top 25)": ("football", "fbs", "associated-press"),
+    "🏀 Men's Basketball (AP Top 25)": ("basketball-men", "d1", "associated-press"),
+    "🏀 Women's Basketball (AP Top 25)": ("basketball-women", "d1", "associated-press"),
+    "🏐 Women's Volleyball (AVCA)": ("volleyball-women", "d1", "avca-coaches"),
+}
+
+
+@st.cache_data(ttl=900)
+def get_ncaa_rankings(sport_slug, division, poll_slug):
+    url = f"https://ncaa-api.henrygd.me/rankings/{sport_slug}/{division}/{poll_slug}"
+    response = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+    response.raise_for_status()
+    return response.json()
+
+
+def _extract_ranking_rows(payload):
+    """Normalize several NCAA ranking response shapes into simple table rows."""
+    if not payload:
+        return []
+
+    candidates = []
+    if isinstance(payload, dict):
+        for key in ("rankings", "data", "teams", "rows", "items"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                candidates.extend(value)
+    elif isinstance(payload, list):
+        candidates = payload
+
+    rows = []
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        team = item.get("team") if isinstance(item.get("team"), dict) else {}
+        name = (item.get("teamName") or item.get("name") or item.get("school") or
+                team.get("name") or team.get("fullName") or team.get("displayName"))
+        rank = item.get("rank") or item.get("ranking") or item.get("position")
+        record = item.get("record") or item.get("overallRecord") or item.get("winsLosses")
+        points = item.get("points") or item.get("votes") or item.get("totalPoints")
+        previous = item.get("previousRank") or item.get("lastWeek") or item.get("previous")
+        if name is not None and rank is not None:
+            rows.append({
+                "Rank": rank,
+                "Team": name,
+                "Record": record or "",
+                "Points/Votes": points or "",
+                "Previous": previous or "",
+            })
+
+    # Some NCAA responses nest the ranking rows more deeply.
+    if not rows:
+        for obj in _walk_json(payload):
+            if not isinstance(obj, dict):
+                continue
+            rank = obj.get("rank") or obj.get("ranking") or obj.get("position")
+            name = obj.get("teamName") or obj.get("school") or obj.get("name")
+            if rank is not None and name is not None:
+                rows.append({
+                    "Rank": rank,
+                    "Team": name,
+                    "Record": obj.get("record") or obj.get("overallRecord") or "",
+                    "Points/Votes": obj.get("points") or obj.get("votes") or "",
+                    "Previous": obj.get("previousRank") or obj.get("lastWeek") or "",
+                })
+
+    # De-duplicate rows while preserving order.
+    seen = set()
+    unique = []
+    for row in rows:
+        key = (str(row["Rank"]), str(row["Team"]))
+        if key not in seen:
+            seen.add(key)
+            unique.append(row)
+    return unique[:50]
 
 
 @st.cache_data(ttl=15)
@@ -210,8 +289,10 @@ def get_ncaa_scoreboard(sport_slug, division, sport_name, timezone_name):
         away_names = away.get("names", {}) or {}
         home_names = home.get("names", {}) or {}
 
-        away_name = away_names.get("full") or away_names.get("short") or "Away"
-        home_name = home_names.get("full") or home_names.get("short") or "Home"
+        away_name = away_names.get("full") or away_names.get("short") or away.get("name") or "Away"
+        home_name = home_names.get("full") or home_names.get("short") or home.get("name") or "Home"
+        away_logo = _ncaa_logo_url(away_names)
+        home_logo = _ncaa_logo_url(home_names)
         game_id = str(game.get("gameID") or game.get("gameId") or f"ncaa-{away_name}-{home_name}")
 
         # Prefer NCAA's epoch timestamp; otherwise combine startDate + startTime.
@@ -273,8 +354,8 @@ def get_ncaa_scoreboard(sport_slug, division, sport_name, timezone_name):
             },
             "competitions": [{
                 "competitors": [
-                    {"homeAway": "away", "team": {"id": str(away.get("id", "")), "displayName": away_name, "logo": away.get("logo", "")}, "score": str(away_score)},
-                    {"homeAway": "home", "team": {"id": str(home.get("id", "")), "displayName": home_name, "logo": home.get("logo", "")}, "score": str(home_score)},
+                    {"homeAway": "away", "team": {"id": str(away.get("id", "")), "displayName": away_name, "logo": away_logo}, "score": str(away_score)},
+                    {"homeAway": "home", "team": {"id": str(home.get("id", "")), "displayName": home_name, "logo": home_logo}, "score": str(home_score)},
                 ],
                 "broadcasts": ([{"names": [game.get("network")]}] if game.get("network") else []),
             }],
@@ -624,14 +705,16 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold):
     close_games = [g for g in live_games if g["diff"] < threshold]
     favorite_games = [g for g in games if is_favorite(g, favorites)]
 
-    games_by_closeness = sorted(
-        games,
-        key=lambda g: (
-            g["state"] != "in",
-            g["diff"] if g["state"] in ("in", "post") else 9999,
-            g["event_time"] or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone)),
-        ),
+    live_sorted = sorted(
+        [g for g in games if g["state"] == "in"],
+        key=lambda g: (g["diff"], g["event_time"] or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone))),
     )
+    final_sorted = sorted(
+        [g for g in games if g["state"] == "post"],
+        key=lambda g: g["event_time"] or datetime.min.replace(tzinfo=ZoneInfo(selected_timezone)),
+        reverse=True,
+    )
+    games_by_closeness = live_sorted + final_sorted
 
     upcoming_today = sorted(
         [g for g in games if g["state"] == "pre"],
@@ -660,21 +743,42 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold):
         st.info("Select teams in the sidebar to build your My Teams dashboard.")
 
     st.markdown("---")
+    st.subheader("🏅 Rankings")
+    ranking_choice = st.selectbox(
+        "Ranking",
+        list(RANKING_CONFIGS.keys()),
+        key="ranking_choice",
+    )
+    r_sport, r_division, r_poll = RANKING_CONFIGS[ranking_choice]
+    try:
+        ranking_payload = get_ncaa_rankings(r_sport, r_division, r_poll)
+        ranking_rows = _extract_ranking_rows(ranking_payload)
+        if ranking_rows:
+            st.dataframe(ranking_rows, use_container_width=True, hide_index=True)
+        else:
+            st.info("The NCAA ranking feed did not return ranked teams for this poll right now.")
+    except requests.RequestException as exc:
+        st.warning(f"Rankings are temporarily unavailable: {exc}")
+    except Exception as exc:
+        st.warning(f"Could not parse the NCAA rankings: {type(exc).__name__}: {exc}")
+
+    st.markdown("---")
+    st.subheader("🏆 Games — Sorted by Closeness")
+    if not games_by_closeness:
+        st.info("No live or completed games are currently available for the selected sports today.")
+    else:
+        st.caption("Live games are sorted closest first. Completed games follow.")
+        for game in games_by_closeness:
+            render_game(game, favorite=is_favorite(game, favorites), close=(game["state"] == "in" and game["diff"] < threshold))
+
+    st.markdown("---")
     st.subheader("📅 Upcoming Today")
     if not upcoming_today:
         st.info("No upcoming games are currently listed by the NCAA for today in the selected sports.")
     else:
-        st.caption("Games scheduled for later today, according to the NCAA.")
+        st.caption("Upcoming games are sorted by start time and placed below the live/completed games.")
         for game in upcoming_today:
             render_game(game, favorite=is_favorite(game, favorites), close=False)
-
-    st.markdown("---")
-    st.subheader("🏆 All Games — Sorted by Closeness")
-    if not games_by_closeness:
-        st.info("No games are currently available for the selected sports today.")
-    else:
-        for game in games_by_closeness:
-            render_game(game, favorite=is_favorite(game, favorites), close=(game["state"] == "in" and game["diff"] < threshold))
 
 
 live_dashboard(timezone_label, selected_timezone, sport_filter, threshold)
