@@ -1633,7 +1633,6 @@ def parse_games(data, timezone_name, target_date=None):
         game for game in games
         if game.get("sport") == "🏐 Women's Volleyball" and game.get("state") in ("in", "post")
         and game.get("id") and not str(game.get("id")).startswith("ncaa-")
-        and (game.get("state") == "post" or game.get("volleyball_current_away") is None or game.get("volleyball_current_home") is None)
     ]
 
     def fetch_vb_info(game):
@@ -2277,13 +2276,14 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, close_thresh
     def close_limit(game):
         return int(close_thresholds.get(game.get("sport"), 7))
     close_games = [g for g in live_games if g["diff"] <= close_limit(g)]
+    other_live_games = [g for g in live_games if g["diff"] > close_limit(g)]
     favorite_games = [g for g in games if is_favorite(g, favorites)]
     live_sorted = sorted(live_games, key=lambda g: (g["diff"], g["event_time"] or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone))))
     final_sorted = sorted([g for g in games if g["state"] == "post"], key=lambda g: g["event_time"] or datetime.min.replace(tzinfo=ZoneInfo(selected_timezone)), reverse=True)
     upcoming_today = sorted([g for g in games if g["state"] == "pre"], key=lambda g: g["event_time"] or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone)))
 
-    c1,c2,c3,c4,c5 = st.columns(5)
-    c1.metric("🔴 Live", len(live_games)); c2.metric("🔥 Close", len(close_games)); c3.metric("⭐ My Teams", len(favorite_games)); c4.metric("🏆 Games", len(games)); c5.metric("🔔 Alerts", sum(bool(st.session_state.get(_alert_key(g["id"]), False)) for g in all_games_for_alerts))
+    c1,c2,c3,c4,c5,c6 = st.columns(6)
+    c1.metric("🔴 Live", len(live_games)); c2.metric("🔥 Close", len(close_games)); c3.metric("📺 Other Live", len(other_live_games)); c4.metric("⭐ My Teams", len(favorite_games)); c5.metric("🏆 Games", len(games)); c6.metric("🔔 Alerts", sum(bool(st.session_state.get(_alert_key(g["id"]), False)) for g in all_games_for_alerts))
 
     st.markdown("---")
     st.subheader("⭐ My Teams")
@@ -2410,6 +2410,16 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, close_thresh
         context = "main"
         render_alert_toggle(game, context, i)
         render_game({**game, "_render_context":context}, favorite=is_favorite(game, favorites), close=True, rankings=ranking_maps.get(game["sport"], {}), records=record_maps.get(game["sport"], {}), compact=compact_mode)
+
+    st.markdown("---")
+    st.subheader("📺 Other Live Games")
+    other_live_sorted = sorted(other_live_games, key=lambda g: (g.get("event_time") or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone)), g.get("diff", 999)))
+    if not other_live_sorted:
+        st.info("No other live games match the current filters.")
+    other_start = len(close_sorted)
+    for i, game in enumerate(other_live_sorted):
+        render_alert_toggle(game, "other-live", other_start + i)
+        render_game({**game, "_render_context":"other-live"}, favorite=is_favorite(game, favorites), close=False, rankings=ranking_maps.get(game["sport"], {}), records=record_maps.get(game["sport"], {}), compact=compact_mode)
 
     st.markdown("---")
     st.subheader("🏁 Final")
