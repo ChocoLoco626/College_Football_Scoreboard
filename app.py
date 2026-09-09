@@ -470,8 +470,8 @@ def get_ncaa_scoreboard(sport_slug, division, sport_name, timezone_name):
             },
             "competitions": [{
                 "competitors": [
-                    {"homeAway": "away", "team": {"id": str(away.get("id", "")), "displayName": away_name, "logo": away_logo}, "score": str(away_score)},
-                    {"homeAway": "home", "team": {"id": str(home.get("id", "")), "displayName": home_name, "logo": home_logo}, "score": str(home_score)},
+                    {"homeAway": "away", "team": {"id": str(away.get("id", "")), "displayName": away_name, "logo": away_logo, "conferences": away.get("conferences", [])}, "score": str(away_score)},
+                    {"homeAway": "home", "team": {"id": str(home.get("id", "")), "displayName": home_name, "logo": home_logo, "conferences": home.get("conferences", [])}, "score": str(home_score)},
                 ],
                 "broadcasts": ([{"names": [game.get("network")]}] if game.get("network") else []),
                 "_venue": game.get("venue") or game.get("venueName") or game.get("location") or "",
@@ -538,6 +538,42 @@ def get_all_scoreboards(timezone_name):
     return {"events": combined, "errors": errors, "diagnostics": diagnostics}
 
 
+def _extract_conference(team):
+    """Return a team conference name/slug from NCAA scoreboard data."""
+    if not isinstance(team, dict):
+        return ""
+    conferences = team.get("conferences") or []
+    if isinstance(conferences, dict):
+        conferences = [conferences]
+    if isinstance(conferences, list):
+        for conf in conferences:
+            if isinstance(conf, dict):
+                name = (conf.get("conferenceName") or conf.get("name") or
+                        conf.get("conference") or conf.get("conferenceSeo") or
+                        conf.get("slug"))
+                if name:
+                    return str(name).strip()
+    for key in ("conferenceName", "conference", "conferenceSeo", "conferenceSlug"):
+        if team.get(key):
+            return str(team[key]).strip()
+    return ""
+
+
+def _pretty_conference(value):
+    """Turn NCAA conference slugs into friendly labels."""
+    labels = {
+        "sec": "SEC", "big-ten": "Big Ten", "big-12": "Big 12",
+        "acc": "ACC", "pac-12": "Pac-12", "aac": "AAC",
+        "sun-belt": "Sun Belt", "conference-usa": "Conference USA",
+        "mountain-west": "Mountain West", "mac": "MAC", "independent": "Independent",
+        "ivy-league": "Ivy League", "big-east": "Big East",
+        "atlantic-10": "Atlantic 10", "wcc": "WCC", "mvc": "Missouri Valley",
+        "a-10": "Atlantic 10", "american": "AAC",
+    }
+    key = _normalize_team_name(value).replace(" ", "-")
+    return labels.get(key, str(value).strip())
+
+
 def parse_games(data, timezone_name):
     games = []
     for event in data.get("events", []):
@@ -580,6 +616,8 @@ def parse_games(data, timezone_name):
             "away_id": str(away.get("team", {}).get("id", "")),
             "home_logo": home.get("team", {}).get("logo", ""),
             "away_logo": away.get("team", {}).get("logo", ""),
+            "away_conference": _pretty_conference(_extract_conference(away.get("team", {}))),
+            "home_conference": _pretty_conference(_extract_conference(home.get("team", {}))),
             "home_score": hs,
             "away_score": aws,
             "diff": abs(hs - aws),
@@ -748,7 +786,7 @@ def render_game(game, favorite=False, close=False, rankings=None):
     if game.get("venue"):
         st.caption("📍 Venue: " + game["venue"])
 
-def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold):
+def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, conference_filter, top25_only):
     st.title("🏆 College Sports Live")
     st.caption(f"NCAA college scores • Showing times in {timezone_label}")
 
@@ -830,6 +868,25 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold):
     today = today_in_timezone(selected_timezone)
     games = [g for g in games if g.get("event_date") == today]
 
+    # Build the inline ranking maps once so the Top 25 filter and game cards
+    # use the exact same ranking source.
+    ranking_maps = get_inline_ranking_maps()
+
+    if conference_filter:
+        selected_conferences = set(conference_filter)
+        games = [
+            g for g in games
+            if g.get("away_conference") in selected_conferences
+            or g.get("home_conference") in selected_conferences
+        ]
+
+    if top25_only:
+        games = [
+            g for g in games
+            if (ranking_maps.get(g["sport"], {}).get(_normalize_team_name(g["away"])))
+            or (ranking_maps.get(g["sport"], {}).get(_normalize_team_name(g["home"])))
+        ]
+
     favorites = st.session_state.favorites
     live_games = [g for g in games if g["state"] == "in"]
     close_games = [g for g in live_games if g["diff"] < threshold]
@@ -857,8 +914,6 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold):
     c3.metric("⭐ My Teams", len(favorite_games))
     c4.metric("🏆 Today's Games", len(games))
     st.markdown("---")
-
-    ranking_maps = get_inline_ranking_maps()
 
     st.subheader("⭐ My Teams")
     if favorite_games:
@@ -909,6 +964,25 @@ with st.sidebar:
         default=list(SPORTS.keys()),
     )
 
+    conference_options = [
+        "ACC", "AAC", "Atlantic 10", "Big 12", "Big East",
+        "Big Ten", "Ivy League", "MAC", "Mountain West", "Pac-12",
+        "SEC", "Sun Belt", "Conference USA", "Missouri Valley", "WCC",
+        "Independent",
+    ]
+    conference_filter = st.multiselect(
+        "Conferences",
+        conference_options,
+        default=[],
+        help="Show games involving at least one team from the selected conference(s)."
+    )
+
+    top25_only = st.checkbox(
+        "🏆 Top 25 teams only",
+        value=False,
+        help="Show games involving at least one team currently in the supported NCAA Top 25/AVCA rankings."
+    )
+
     threshold = st.slider(
         "Close-game threshold",
         min_value=1,
@@ -942,4 +1016,4 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-live_dashboard(timezone_label, selected_timezone, sport_filter, threshold)
+live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, conference_filter, top25_only)

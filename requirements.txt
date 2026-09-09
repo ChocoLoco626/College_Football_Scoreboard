@@ -1,3 +1,2 @@
-streamlit>=1.37,<2
-requests>=2.32,<3
-tzdata>=2024.1
+streamlit>=1.37
+requests>=2.31
