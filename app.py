@@ -602,63 +602,81 @@ def get_ncaa_scoreboard(sport_slug, division, sport_name, timezone_name, target_
     }
 
 
-@st.cache_data(ttl=1800)
-def get_ncaa_schedule_alt(sport_slug, division, season_year, timezone_name):
-    """Season schedule safety net for games missing from a date scoreboard.
 
-    NCAA's 2026+ schedule-alt endpoint is season-wide. We use it only as a
-    fallback, primarily to recover scheduled/future favorite-team games that
-    are not present in the date scoreboard yet.
-    """
+@st.cache_data(ttl=1800)
+def get_ncaa_schedule_alt(sport_slug, division, season_year):
+    """Fetch the NCAA's newer full-season schedule feed (2026+)."""
     url = f"https://ncaa-api.henrygd.me/schedule-alt/{sport_slug}/{division}/{season_year}"
     response = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
     response.raise_for_status()
-    payload = response.json()
+    return response.json()
 
-    found = []
+
+def _walk_schedule_nodes(value):
+    """Yield nested dictionaries from the flexible schedule-alt response."""
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk_schedule_nodes(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_schedule_nodes(child)
+
+
+def _schedule_team_name(team):
+    if not isinstance(team, dict):
+        return ""
+    names = team.get("names") or {}
+    return (
+        team.get("displayName") or team.get("nameFull") or names.get("full") or
+        names.get("short") or team.get("name") or team.get("teamName") or ""
+    )
+
+
+def _schedule_candidates(payload):
+    """Extract contest-like records without depending on one response shape."""
     seen = set()
+    for node in _walk_schedule_nodes(payload):
+        teams = node.get("teams")
+        if isinstance(teams, list) and len(teams) >= 2:
+            yield node, teams[:2]
+            continue
+        home = node.get("home")
+        away = node.get("away")
+        if isinstance(home, dict) and isinstance(away, dict):
+            key = (str(node.get("contestId") or node.get("gameID") or ""), _schedule_team_name(home), _schedule_team_name(away))
+            if key not in seen:
+                seen.add(key)
+                yield node, [away, home]
 
-    def walk(value):
-        if isinstance(value, dict):
-            teams = value.get("teams")
-            if isinstance(teams, list) and len(teams) >= 2 and (
-                value.get("contestId") or value.get("startDate") or value.get("startTimeEpoch")
-            ):
-                found.append(value)
-            # Some schedule responses wrap contests one level deeper.
-            for child in value.values():
-                walk(child)
-        elif isinstance(value, list):
-            for child in value:
-                walk(child)
 
-    walk(payload)
+def get_schedule_fallback_events(sport_slug, division, sport_name, timezone_name, target_date):
+    """Recover scheduled games missing from a date scoreboard feed.
 
+    This is intentionally cached for 30 minutes. It is a schedule-recovery
+    layer, not part of the 30-second live-score refresh loop.
+    """
+    payload = get_ncaa_schedule_alt(sport_slug, division, target_date.year)
     events = []
-    for contest in found:
-        contest_id = str(contest.get("contestId") or contest.get("id") or "")
-        if contest_id and contest_id in seen:
+    try:
+        school_index = get_ncaa_schools_index()
+    except Exception:
+        school_index = {}
+
+    for node, teams in _schedule_candidates(payload):
+        if len(teams) < 2:
             continue
-        if contest_id:
-            seen.add(contest_id)
-
-        teams = contest.get("teams") or []
-        home = next((t for t in teams if t.get("isHome")), None)
-        away = next((t for t in teams if not t.get("isHome")), None)
-        if not home or not away:
+        # NCAA contest records expose isHome; fall back to the pair ordering.
+        home_team = next((t for t in teams if isinstance(t, dict) and t.get("isHome") is True), teams[-1])
+        away_team = next((t for t in teams if isinstance(t, dict) and t.get("isHome") is False), teams[0])
+        away_name = _schedule_team_name(away_team)
+        home_name = _schedule_team_name(home_team)
+        if not away_name or not home_name:
             continue
-
-        def team_name(team):
-            return (
-                team.get("nameFull") or team.get("nameShort") or team.get("name")
-                or team.get("schoolName") or "Unknown"
-            )
-
-        home_name = team_name(home)
-        away_name = team_name(away)
 
         event_dt = None
-        epoch = contest.get("startTimeEpoch")
+        start_time = node.get("startTime") or node.get("time") or ""
+        epoch = node.get("startTimeEpoch") or node.get("startTimestamp") or node.get("timestamp")
         if epoch not in (None, ""):
             try:
                 value = float(epoch)
@@ -666,45 +684,68 @@ def get_ncaa_schedule_alt(sport_slug, division, season_year, timezone_name):
                     value /= 1000
                 event_dt = datetime.fromtimestamp(value, tz=ZoneInfo("UTC")).astimezone(ZoneInfo(timezone_name))
             except (TypeError, ValueError, OverflowError):
-                event_dt = None
-        if event_dt is None:
-            start_date = str(contest.get("startDate") or "")[:10]
-            start_time = str(contest.get("startTime") or "").strip()
-            if start_date:
-                import re
-                match = re.match(r"^(\d{1,2}:\d{2})\s*(AM|PM)?", start_time, re.I)
-                if match:
-                    clock = match.group(1)
-                    ampm = match.group(2) or ""
-                    try:
-                        naive = datetime.strptime(
-                            f"{start_date} {clock} {ampm}".strip(),
-                            "%Y-%m-%d %I:%M %p" if ampm else "%Y-%m-%d %H:%M",
-                        )
-                        event_dt = naive.replace(tzinfo=ZoneInfo("America/New_York")).astimezone(ZoneInfo(timezone_name))
-                    except ValueError:
-                        pass
+                pass
 
-        if not event_dt:
+        if event_dt is None:
+            start_date = node.get("startDate") or node.get("date") or node.get("gameDate")
+            if isinstance(start_date, str) and start_date:
+                try:
+                    # New NCAA schedule data's startTime is presented in ET.
+                    text = str(start_time).replace(" ET", "").replace(" EST", "").replace(" EDT", "").strip()
+                    import re
+                    m = re.search(r"(\d{1,2}:\d{2})\s*(AM|PM)?", text, re.I)
+                    if m:
+                        clock, ampm = m.group(1), m.group(2) or ""
+                        fmt = "%Y-%m-%d %I:%M %p" if ampm else "%Y-%m-%d %H:%M"
+                        naive = datetime.strptime(f"{start_date[:10]} {clock} {ampm}".strip(), fmt)
+                        event_dt = naive.replace(tzinfo=ZoneInfo("America/New_York")).astimezone(ZoneInfo(timezone_name))
+                    else:
+                        # A scheduled game with no announced kickoff (TBA)
+                        # still belongs to the selected calendar date. Use a
+                        # neutral noon placeholder in the user's timezone so
+                        # midnight conversion cannot move it to another date.
+                        event_dt = datetime.fromisoformat(start_date[:10]).replace(tzinfo=ZoneInfo(timezone_name), hour=12, minute=0)
+                except (TypeError, ValueError):
+                    pass
+
+        if event_dt is None or event_dt.date() != target_date:
             continue
 
+        game_id = str(node.get("contestId") or node.get("gameID") or node.get("id") or f"schedule-{away_name}-{home_name}-{event_dt.isoformat()}")
+        away_id = str(away_team.get("id") or away_team.get("teamId") or "")
+        home_id = str(home_team.get("id") or home_team.get("teamId") or "")
+        away_names = away_team.get("names") or {}
+        home_names = home_team.get("names") or {}
+        away_logo = away_team.get("logo") or _ncaa_logo_url(away_names, away_team, school_index)
+        home_logo = home_team.get("logo") or _ncaa_logo_url(home_names, home_team, school_index)
+        state_raw = str(node.get("gameState") or node.get("status") or "P").upper()
+        state = "in" if state_raw in ("I", "LIVE", "IN") else ("post" if state_raw in ("F", "FINAL", "POST") else "pre")
+        try:
+            away_score = int(away_team.get("score") or 0)
+        except (TypeError, ValueError):
+            away_score = 0
+        try:
+            home_score = int(home_team.get("score") or 0)
+        except (TypeError, ValueError):
+            home_score = 0
+
         events.append({
-            "id": contest_id or f"schedule-{away_name}-{home_name}-{event_dt.isoformat()}",
+            "id": game_id,
             "date": event_dt.isoformat(),
-            "status": {"type": {"state": "pre", "shortDetail": contest.get("startTime") or "", "detail": contest.get("startTime") or ""}, "displayClock": "", "period": ""},
+            "status": {"type": {"state": state, "shortDetail": node.get("finalMessage") or (start_time if start_time else "TBA"), "detail": node.get("finalMessage") or (start_time if start_time else "TBA")}},
             "competitions": [{
                 "competitors": [
-                    {"homeAway": "away", "team": {"id": str(away.get("id") or away.get("teamId") or ""), "displayName": away_name, "logo": "", "conferences": []}, "score": "0"},
-                    {"homeAway": "home", "team": {"id": str(home.get("id") or home.get("teamId") or ""), "displayName": home_name, "logo": "", "conferences": []}, "score": "0"},
+                    {"homeAway": "away", "team": {"id": away_id, "displayName": away_name, "logo": away_logo}, "score": str(away_score)},
+                    {"homeAway": "home", "team": {"id": home_id, "displayName": home_name, "logo": home_logo}, "score": str(home_score)},
                 ],
-                "broadcasts": ([{"names": [contest.get("broadcasterName")]}] if contest.get("broadcasterName") else []),
-                "_venue": contest.get("venue") or contest.get("venueName") or "",
+                "broadcasts": ([{"names": [node.get("broadcasterName")]}] if node.get("broadcasterName") else []),
+                "_venue": node.get("venue") or node.get("venueName") or node.get("location") or "",
             }],
-            "_event_name": contest.get("eventName") or contest.get("title") or "",
-            "_event_context": contest.get("roundDescription") or "",
-            "_tournament_name": contest.get("championshipName") or "",
-            "_round_name": contest.get("roundDescription") or "",
-            "_sport_name": sport_slug,
+            "_event_name": node.get("contestName") or node.get("eventName") or "",
+            "_event_context": node.get("roundDescription") or node.get("description") or "",
+            "_tournament_name": node.get("tournamentName") or "",
+            "_round_name": node.get("roundDescription") or "",
+            "_sport_name": sport_name,
             "_sport": sport_slug,
             "_league": sport_slug,
             "_division": "NCAA D-I" if division == "d1" else division.upper(),
@@ -726,7 +767,7 @@ NCAA_SPORTS = {
 
 
 @st.cache_data(ttl=20)
-def get_all_scoreboards(timezone_name, target_date=None, favorite_team_names=()):
+def get_all_scoreboards(timezone_name, target_date=None):
     """Fetch NCAA scoreboards for a selected local calendar date.
 
     Football is fetched by NCAA week, then the dashboard filters games by the
@@ -776,58 +817,32 @@ def get_all_scoreboards(timezone_name, target_date=None, favorite_team_names=())
                         if event_id:
                             seen_ids.add(event_id)
                         combined.append(event)
-
-                    # Safety net: if a favorite has no game in the scoreboard feed
-                    # for this sport/date, consult NCAA's season schedule endpoint.
-                    # This catches scheduled/future marquee games such as
-                    # Kentucky-Louisville that may not yet be present in the
-                    # date-scoped scoreboard response.
-                    if favorite_team_names:
-                        existing_names = set()
-                        for event in combined:
-                            if event.get("_sport") != sport_slug:
-                                continue
-                            raw_date = event.get("date")
-                            if not raw_date:
-                                continue
-                            try:
-                                local_event_date = datetime.fromisoformat(raw_date.replace("Z", "+00:00")).astimezone(ZoneInfo(timezone_name)).date()
-                            except ValueError:
-                                continue
-                            if local_event_date != target_date:
-                                continue
-                            comp = (event.get("competitions") or [{}])[0]
-                            for competitor in comp.get("competitors") or []:
-                                existing_names.add(_normalize_team_name((competitor.get("team") or {}).get("displayName", "")))
-    
-                        missing_favorite = any(
-                            _normalize_team_name(fav) not in existing_names
-                            and not any(_normalize_team_name(fav) in name or name in _normalize_team_name(fav) for name in existing_names)
-                            for fav in favorite_team_names
-                        )
-                        if missing_favorite:
-                            try:
-                                schedule_events = get_ncaa_schedule_alt(sport_slug, division, target_date.year, timezone_name)
-                                for event in schedule_events:
-                                    raw_date = event.get("date")
-                                    try:
-                                        local_event_date = datetime.fromisoformat(raw_date.replace("Z", "+00:00")).astimezone(ZoneInfo(timezone_name)).date() if raw_date else None
-                                    except ValueError:
-                                        local_event_date = None
-                                    if local_event_date != target_date:
-                                        continue
-                                    event["_sport_name"] = sport_name
-                                    event["_requested_ncaa_date"] = "schedule-alt"
-                                    event_id = str(event.get("id", ""))
-                                    if event_id and event_id not in seen_ids:
-                                        seen_ids.add(event_id)
-                                        combined.append(event)
-                            except Exception as schedule_exc:
-                                errors.append(f"{sport_name} schedule fallback: {type(schedule_exc).__name__}: {schedule_exc}")
                 except requests.RequestException as exc:
                     errors.append(f"{sport_name} ({sport_slug}/{division}, {fetch_date}): {exc}")
                 except Exception as exc:
                     errors.append(f"{sport_name} ({sport_slug}/{division}, {fetch_date}): {type(exc).__name__}: {exc}")
+
+            # Schedule recovery: if the normal scoreboard feed missed a
+            # scheduled contest, consult the cached full-season schedule.
+            # This is especially important for future football games such as
+            # Kentucky-Louisville, which may not appear on the live scoreboard
+            # until NCAA publishes them into the date feed.
+            try:
+                fallback_events = get_schedule_fallback_events(
+                    sport_slug, division, sport_name, timezone_name, target_date
+                )
+                existing = {str(e.get("id")) for e in combined if e.get("_sport_name") == sport_name}
+                for event in fallback_events:
+                    event_id = str(event.get("id"))
+                    if event_id and event_id not in existing:
+                        event["_from_schedule_fallback"] = True
+                        event["_requested_ncaa_date"] = str(target_date)
+                        combined.append(event)
+                        existing.add(event_id)
+            except Exception as exc:
+                # Schedule recovery is supplemental; don't mark the entire
+                # scoreboard disconnected when this optional feed is down.
+                diagnostics.append({"sport": sport_name, "schedule_fallback_error": str(exc)})
     fetched_at = datetime.now(ZoneInfo(timezone_name)).isoformat()
     return {
         "events": combined,
@@ -1490,10 +1505,10 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, c
         date_label = "Yesterday"
     else:
         date_label = selected_date.strftime("%A, %B %-d, %Y") if hasattr(selected_date, "strftime") else str(selected_date)
-    st.caption(f"NCAA college scores • {date_label} • Showing times in {timezone_label}")
+    st.caption(f"NCAA college scores • {date_label} • Game times shown in {timezone_label}")
 
     try:
-        data = get_all_scoreboards(selected_timezone, selected_date, tuple(st.session_state.get("favorites", {}).keys()))
+        data = get_all_scoreboards(selected_timezone, selected_date)
         games = parse_games(data, selected_timezone)
         games = dedupe_games(games)
 
@@ -1664,7 +1679,7 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, c
                             except (TypeError, ValueError):
                                 pass
                         else:
-                            status = game.get("event_time").strftime("%I:%M %p").lstrip("0") if game.get("event_time") else "UPCOMING"
+                            status = game.get("event_time").strftime("%I:%M %p %Z").lstrip("0") if game.get("event_time") else "UPCOMING"
                             score = "—"
 
                         alert = bool(st.session_state.get(_alert_key(game["id"]), False))

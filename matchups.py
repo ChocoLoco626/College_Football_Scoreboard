@@ -85,6 +85,39 @@ TEAM_ALIASES = {
     "yale": ["yale", "yale bulldogs"],
 }
 
+# Additional common NCAA school aliases used by rivalry schedules.
+TEAM_ALIASES.update({
+    "indiana": ["indiana", "indiana hoosiers"],
+    "purdue": ["purdue", "purdue boilermakers"],
+    "missouri": ["missouri", "missouri tigers", "mizzou"],
+    "illinois": ["illinois", "illinois fighting illini"],
+    "arizona": ["arizona", "arizona wildcats"],
+    "arizona state": ["arizona state", "arizona state sun devils", "asu"],
+    "georgetown": ["georgetown", "georgetown hoyas"],
+    "villanova": ["villanova", "villanova wildcats"],
+    "cincinnati": ["cincinnati", "cincinnati bearcats"],
+    "xavier": ["xavier", "xavier musketeers"],
+    "gonzaga": ["gonzaga", "gonzaga bulldogs"],
+    "saint marys": ["saint marys", "saint mary's", "saint marys gaels"],
+    "oregon": ["oregon", "oregon ducks"],
+    "washington": ["washington", "washington huskies"],
+    "stanford": ["stanford", "stanford cardinal"],
+    "california": ["california", "cal", "california golden bears"],
+    "colorado": ["colorado", "colorado buffaloes"],
+    "colorado state": ["colorado state", "colorado state rams"],
+    "brigham young": ["brigham young", "byu", "byu cougars"],
+    "utah": ["utah", "utah utes"],
+    "baylor": ["baylor", "baylor bears"],
+    "texas christian": ["texas christian", "tcu", "tcu horned frogs"],
+    "texas tech": ["texas tech", "texas tech red raiders"],
+    "virginia": ["virginia", "virginia cavaliers"],
+    "virginia tech": ["virginia tech", "virginia tech hokies"],
+    "maryland": ["maryland", "maryland terrapins"],
+    "rutgers": ["rutgers", "rutgers scarlet knights"],
+    "south carolina": ["south carolina", "south carolina gamecocks"],
+    "clemson": ["clemson", "clemson tigers"],
+})
+
 TEAM_KEY_BY_ALIAS = {}
 for key, aliases in TEAM_ALIASES.items():
     for alias in aliases:
@@ -157,6 +190,31 @@ MATCHUP_INFO = {
     frozenset(("duke", "north carolina")): {"type": "rivalry", "name": "Duke–UNC", "icon": "🔥"},
     frozenset(("kentucky", "louisville")): {"type": "rivalry", "name": "Governor's Cup", "icon": "🔥"},
 }
+
+# Expanded high-profile rivalry coverage.
+MATCHUP_INFO.update({
+    frozenset(("indiana", "purdue")): {"type": "rivalry", "name": "Old Oaken Bucket", "icon": "🔥"},
+    frozenset(("illinois", "northwestern")): {"type": "rivalry", "name": "Land of Lincoln", "icon": "🔥"},
+    frozenset(("illinois", "missouri")): {"type": "rivalry", "name": "Braggin' Rights", "icon": "🔥"},
+    frozenset(("arizona", "arizona state")): {"type": "rivalry", "name": "Territorial Cup", "icon": "🔥"},
+    frozenset(("california", "stanford")): {"type": "rivalry", "name": "The Big Game", "icon": "🔥"},
+    frozenset(("colorado", "colorado state")): {"type": "rivalry", "name": "Rocky Mountain Showdown", "icon": "🔥"},
+    frozenset(("brigham young", "utah")): {"type": "rivalry", "name": "Holy War", "icon": "🔥"},
+    frozenset(("baylor", "texas christian")): {"type": "rivalry", "name": "Revivalry", "icon": "🔥"},
+    frozenset(("cincinnati", "xavier")): {"type": "rivalry", "name": "Crosstown Shootout", "icon": "🔥"},
+    frozenset(("georgetown", "villanova")): {"type": "rivalry", "name": "Georgetown–Villanova", "icon": "🔥"},
+    frozenset(("villanova", "saint marys")): {"type": "rivalry", "name": "Villanova–Saint Mary's", "icon": "🔥"},
+    frozenset(("gonzaga", "saint marys")): {"type": "rivalry", "name": "Gonzaga–Saint Mary's", "icon": "🔥"},
+    frozenset(("kentucky", "indiana")): {"type": "rivalry", "name": "Kentucky–Indiana", "icon": "🔥"},
+    frozenset(("kansas", "missouri")): {"type": "rivalry", "name": "Border War", "icon": "🔥"},
+    frozenset(("kansas", "kansas state")): {"type": "rivalry", "name": "Sunflower Showdown", "icon": "🔥"},
+    frozenset(("florida", "georgia")): {"type": "rivalry", "name": "World's Largest Outdoor Cocktail Party", "icon": "🔥"},
+    frozenset(("clemson", "south carolina")): {"type": "rivalry", "name": "Palmetto Bowl", "icon": "🔥"},
+    frozenset(("virginia", "virginia tech")): {"type": "rivalry", "name": "Commonwealth Clash", "icon": "🔥"},
+    frozenset(("north carolina", "duke")): {"type": "rivalry", "name": "Duke–UNC", "icon": "🔥"},
+    frozenset(("north carolina", "north carolina state")): {"type": "rivalry", "name": "Carolina–NC State", "icon": "🔥"},
+    frozenset(("pittsburgh", "west virginia")): {"type": "rivalry", "name": "Backyard Brawl", "icon": "🔥"},
+})
 
 BOWL_NAMES = [
     "rose bowl", "orange bowl", "sugar bowl", "cotton bowl", "peach bowl", "fiesta bowl",
