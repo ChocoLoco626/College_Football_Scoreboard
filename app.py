@@ -4,27 +4,21 @@ import requests
 import streamlit as st
 
 REFRESH_SECONDS = 30
-ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports"
 TIMEZONES = {
     "Eastern Time": "America/New_York",
     "Central Time": "America/Chicago",
 }
 DEFAULT_TIMEZONE = "Eastern Time"
 
-# Keep the app focused on the sports you said you actually care about.
-# Every sport uses the same ESPN date-window/fallback logic.
 SPORTS = {
-    "🏈 Football": [
-        ("football", "college-football", "FBS", 80),
-        ("football", "college-football", "FCS", 81),
-    ],
-    "⚽ Men's Soccer": [("soccer", "mens-college-soccer", "NCAA", 50)],
-    "⚽ Women's Soccer": [("soccer", "womens-college-soccer", "NCAA", 50)],
-    "🏀 Men's Basketball": [("basketball", "mens-college-basketball", "NCAA", 50)],
-    "🏀 Women's Basketball": [("basketball", "womens-college-basketball", "NCAA", 50)],
-    "🏐 Women's Volleyball": [("volleyball", "womens-college-volleyball", "NCAA", None)],
-    "⚾ Baseball": [("baseball", "college-baseball", "NCAA", 50)],
-    "🥎 Softball": [("softball", "college-softball", "NCAA", 50)],
+    "🏈 Football": [],
+    "⚽ Men's Soccer": [],
+    "⚽ Women's Soccer": [],
+    "🏀 Men's Basketball": [],
+    "🏀 Women's Basketball": [],
+    "🏐 Women's Volleyball": [],
+    "⚾ Baseball": [],
+    "🥎 Softball": [],
 }
 
 DEFAULT_FAVORITES = {"Kentucky": "96", "Auburn": "2", "West Florida": "2908"}
@@ -54,6 +48,143 @@ st.markdown("""
 
 def today_in_timezone(timezone_name):
     return datetime.now(ZoneInfo(timezone_name)).date()
+
+
+def _ncaa_logo_url(team_names):
+    """Build the NCAA API logo URL from the team's NCAA SEO slug."""
+    if not isinstance(team_names, dict):
+        return ""
+    slug = team_names.get("seo") or team_names.get("team_seo") or team_names.get("slug")
+    return f"https://ncaa-api.henrygd.me/logo/{slug}.svg" if slug else ""
+
+
+@st.cache_data(ttl=15)
+def get_ncaa_game_detail(game_id):
+    """Fetch NCAA game-center data on demand (used for volleyball set scores)."""
+    if not game_id or str(game_id).startswith("ncaa-"):
+        return None
+    url = f"https://ncaa-api.henrygd.me/game/{game_id}"
+    response = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+    response.raise_for_status()
+    return response.json()
+
+
+@st.cache_data(ttl=15)
+def get_ncaa_boxscore(game_id):
+    """Fetch the NCAA boxscore as a fallback for set/period scoring."""
+    if not game_id or str(game_id).startswith("ncaa-"):
+        return None
+    url = f"https://ncaa-api.henrygd.me/game/{game_id}/boxscore"
+    response = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+    response.raise_for_status()
+    return response.json()
+
+
+def _walk_json(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk_json(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_json(child)
+
+
+def _first_number(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, str) and not value.strip().isdigit():
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_volleyball_set_scores(payload, away_id="", home_id=""):
+    """Best-effort parser for NCAA game-center set/period scoring structures."""
+    if not payload:
+        return []
+
+    # Most NCAA game-center variants expose period/line/set scores somewhere in
+    # a list. We inspect several naming variants because the upstream GraphQL
+    # schema has changed between API releases.
+    candidate_keys = {
+        "sets", "setsscores", "setscores", "periods", "periodscores",
+        "linescores", "linescore", "linescores", "periodscores",
+    }
+
+    def key_norm(k):
+        return str(k).lower().replace("_", "").replace("-", "")
+
+    # First try to find a single list whose rows contain both teams' values.
+    for obj in _walk_json(payload):
+        for key, value in obj.items():
+            if key_norm(key) not in candidate_keys or not isinstance(value, list) or not value:
+                continue
+            rows = []
+            for idx, row in enumerate(value):
+                if not isinstance(row, dict):
+                    continue
+                label = row.get("name") or row.get("label") or row.get("period") or row.get("set") or row.get("number") or idx + 1
+                away = row.get("awayScore", row.get("away_score"))
+                home = row.get("homeScore", row.get("home_score"))
+                if away is None or home is None:
+                    scores = row.get("scores") or row.get("score")
+                    if isinstance(scores, dict):
+                        away = scores.get("away", scores.get(str(away_id)))
+                        home = scores.get("home", scores.get(str(home_id)))
+                if away is not None and home is not None:
+                    a, h = _first_number(away), _first_number(home)
+                    if a is not None and h is not None:
+                        rows.append({"Set": str(label), "Away": a, "Home": h})
+            if rows:
+                return rows
+
+    # Fallback: locate team objects that contain an array of set/period scores.
+    team_rows = []
+    for obj in _walk_json(payload):
+        if not isinstance(obj, dict):
+            continue
+        team = obj.get("team") if isinstance(obj.get("team"), dict) else None
+        team_name = ""
+        team_key = ""
+        if team:
+            team_name = team.get("name") or team.get("nameShort") or team.get("displayName") or ""
+            team_key = str(team.get("id") or "")
+        elif obj.get("teamId") is not None:
+            team_key = str(obj.get("teamId"))
+            team_name = str(obj.get("teamName") or "")
+        for key, value in obj.items():
+            if key_norm(key) not in candidate_keys or not isinstance(value, list):
+                continue
+            vals = []
+            for row in value:
+                if isinstance(row, dict):
+                    raw = row.get("score", row.get("points", row.get("value")))
+                    n = _first_number(raw)
+                    if n is not None:
+                        vals.append(n)
+                else:
+                    n = _first_number(row)
+                    if n is not None:
+                        vals.append(n)
+            if vals:
+                team_rows.append((team_key, team_name, vals))
+
+    if len(team_rows) >= 2:
+        # Prefer rows matching the scoreboard's team IDs when available.
+        away_row = next((r for r in team_rows if r[0] == str(away_id)), None)
+        home_row = next((r for r in team_rows if r[0] == str(home_id)), None)
+        chosen = [away_row, home_row] if away_row and home_row else team_rows[:2]
+        a_vals, h_vals = chosen[0][2], chosen[1][2]
+        rows = []
+        for i in range(min(len(a_vals), len(h_vals))):
+            rows.append({"Set": str(i + 1), "Away": a_vals[i], "Home": h_vals[i]})
+        if rows:
+            return rows
+
+    return []
 
 
 def get_ncaa_scoreboard(sport_slug, division, sport_name, timezone_name):
@@ -315,8 +446,8 @@ def render_game(game, favorite=False, close=False):
         f"TV: {', '.join(game['broadcasts'])}" if game["broadcasts"] else "",
     ] if x)
 
-    away_logo = f'<img src="{game["away_logo"]}" width="36">' if game["away_logo"] else ""
-    home_logo = f'<img src="{game["home_logo"]}" width="36">' if game["home_logo"] else ""
+    away_logo = f'<img src="{game["away_logo"]}" width="36" style="vertical-align:middle;margin-right:8px;">' if game["away_logo"] else ""
+    home_logo = f'<img src="{game["home_logo"]}" width="36" style="vertical-align:middle;margin-right:8px;">' if game["home_logo"] else ""
 
     if game["state"] in ("in", "post"):
         away_score, home_score = game["away_score"], game["home_score"]
@@ -334,11 +465,46 @@ def render_game(game, favorite=False, close=False):
     st.markdown(f"""
     <div class="game-card">
       <div class="meta">{game['sport']} • {meta}</div>
-      <div class="team">{away_logo} {game['away']}<span class="score">{away_score}</span></div>
-      <div class="team">{home_logo} {game['home']}<span class="score">{home_score}</span></div>
+      <div class="team">{away_logo}{game['away']}<span class="score">{away_score}</span></div>
+      <div class="team">{home_logo}{game['home']}<span class="score">{home_score}</span></div>
       <div class="meta">Score difference: {game['diff']}{clock}{(' • Start: ' + start_time) if start_time else ''}</div>
     </div>
     """, unsafe_allow_html=True)
+
+    if game.get("sport") == "🏐 Women's Volleyball" and game.get("state") in ("in", "post"):
+        key = f"volley_sets_{game['id']}"
+        if key not in st.session_state:
+            st.session_state[key] = None
+        button_label = "📊 Show set scores" if st.session_state[key] is None else "↻ Refresh set scores"
+        if st.button(button_label, key=f"btn_{game['id']}"):
+            try:
+                detail = get_ncaa_game_detail(game["id"])
+                set_scores = _extract_volleyball_set_scores(
+                    detail, game.get("away_id", ""), game.get("home_id", "")
+                )
+                if not set_scores:
+                    try:
+                        boxscore = get_ncaa_boxscore(game["id"])
+                        set_scores = _extract_volleyball_set_scores(
+                            boxscore, game.get("away_id", ""), game.get("home_id", "")
+                        )
+                    except Exception:
+                        pass
+                st.session_state[key] = set_scores
+                st.session_state[f"volley_sets_error_{game['id']}"] = ""
+            except Exception as exc:
+                st.session_state[key] = []
+                st.session_state[f"volley_sets_error_{game['id']}"] = f"Could not retrieve set scores: {type(exc).__name__}: {exc}"
+
+        if st.session_state.get(key) is not None:
+            error = st.session_state.get(f"volley_sets_error_{game['id']}", "")
+            if error:
+                st.warning(error)
+            elif st.session_state[key]:
+                st.caption("Set-by-set score")
+                st.dataframe(st.session_state[key], use_container_width=True, hide_index=True)
+            else:
+                st.info("The NCAA game feed did not provide set-by-set scores for this match yet.")
 
 
 if "favorites" not in st.session_state:
@@ -448,7 +614,7 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold):
     if selected:
         games = [g for g in games if g["sport"] in selected]
 
-    # Only show games whose event timestamp lands on today's ESPN/U.S. Eastern
+    # Only show games whose event timestamp lands on today's selected-time-zone
     # calendar date. Tomorrow is fetched only as a reliability fallback.
     today = today_in_timezone(selected_timezone)
     games = [g for g in games if g.get("event_date") == today]
@@ -496,7 +662,7 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold):
     st.markdown("---")
     st.subheader("📅 Upcoming Today")
     if not upcoming_today:
-        st.info("No upcoming games are currently listed by ESPN for today in the selected sports.")
+        st.info("No upcoming games are currently listed by the NCAA for today in the selected sports.")
     else:
         st.caption("Games scheduled for later today, according to the NCAA.")
         for game in upcoming_today:
