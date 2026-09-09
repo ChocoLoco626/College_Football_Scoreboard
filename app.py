@@ -306,6 +306,22 @@ def get_ncaa_game_detail(game_id):
     return response.json()
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def get_ncaa_volleyball_play_by_play(game_id):
+    """Fetch NCAA volleyball play-by-play as a last-resort source for set points."""
+    if not game_id or str(game_id).startswith("ncaa-"):
+        return None
+    try:
+        response = requests.get(
+            f"https://ncaa-api.henrygd.me/game/{game_id}/play-by-play",
+            timeout=10, headers={"User-Agent": "Mozilla/5.0"}
+        )
+        response.raise_for_status()
+        return response.json()
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def get_ncaa_boxscore(game_id):
     """Fetch the NCAA boxscore as a fallback for set/period scoring."""
@@ -543,8 +559,53 @@ def _extract_volleyball_set_scores(payload, away_id="", home_id=""):
 
 
 
+def _extract_vb_scores_from_pbp(payload, away_id="", home_id=""):
+    """Extract running volleyball set scores from NCAA PBP snapshots."""
+    if not payload:
+        return []
+    def num(v):
+        try:
+            return None if v is None or isinstance(v, bool) else int(v)
+        except (TypeError, ValueError):
+            return None
+    latest = {}
+    for obj in _walk_json(payload):
+        if not isinstance(obj, dict):
+            continue
+        pairs = [
+            (obj.get("awayScore"), obj.get("homeScore")),
+            (obj.get("visitorScore"), obj.get("homeScore")),
+            (obj.get("away_score"), obj.get("home_score")),
+            (obj.get("visitor_score"), obj.get("home_score")),
+            (obj.get("awayPoints"), obj.get("homePoints")),
+            (obj.get("away_points"), obj.get("home_points")),
+        ]
+        pair = None
+        for a, h in pairs:
+            a, h = num(a), num(h)
+            if a is not None and h is not None and 0 <= a <= 60 and 0 <= h <= 60:
+                pair = (a, h); break
+        if pair is None and isinstance(obj.get("score"), dict):
+            sc = obj["score"]
+            a, h = num(sc.get("away", sc.get("visitor", sc.get(str(away_id))))), num(sc.get("home", sc.get(str(home_id))))
+            if a is not None and h is not None and 0 <= a <= 60 and 0 <= h <= 60:
+                pair = (a, h)
+        if pair is None and isinstance(obj.get("score"), str):
+            m = re.search(r"(\d+)\s*[-–:]\s*(\d+)", obj["score"])
+            if m and int(m.group(1)) <= 60 and int(m.group(2)) <= 60:
+                pair = (int(m.group(1)), int(m.group(2)))
+        if pair is None:
+            continue
+        label = obj.get("periodNumber") or obj.get("period") or obj.get("setNumber") or obj.get("set") or obj.get("periodDisplay") or obj.get("setDisplay")
+        m = re.search(r"(\d+)", str(label or ""))
+        if m and 1 <= int(m.group(1)) <= 5:
+            latest[int(m.group(1))] = pair
+    return [{"Set": str(n), "Away": latest[n][0], "Home": latest[n][1]} for n in sorted(latest)]
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def get_volleyball_set_info(game_id, away_id="", home_id=""):
+
     """Return volleyball set wins and points-per-set from NCAA game-center data."""
     if not game_id or str(game_id).startswith("ncaa-"):
         return None
@@ -610,6 +671,29 @@ def get_volleyball_set_info(game_id, away_id="", home_id=""):
             "home_sets": home_sets,
             "away_points": away_points,
             "home_points": home_points,
+            "current_set_number": len(completed_rows) + 1 if current_set else None,
+            "current_set_away": current_set["Away"] if current_set else None,
+            "current_set_home": current_set["Home"] if current_set else None,
+        }
+
+    # Last resort: the NCAA generic PBP feed can contain the running score after each rally.
+    pbp_rows = _extract_vb_scores_from_pbp(get_ncaa_volleyball_play_by_play(game_id), away_id, home_id)
+    if pbp_rows:
+        completed_rows = []
+        current_set = None
+        for idx, row in enumerate(pbp_rows, start=1):
+            a, h = row["Away"], row["Home"]
+            target = 15 if idx >= 5 else 25
+            if max(a, h) >= target and abs(a - h) >= 2:
+                completed_rows.append(row)
+            elif idx == len(pbp_rows):
+                current_set = row
+        return {
+            "rows": pbp_rows,
+            "away_sets": sum(r["Away"] > r["Home"] for r in completed_rows),
+            "home_sets": sum(r["Home"] > r["Away"] for r in completed_rows),
+            "away_points": [r["Away"] for r in pbp_rows],
+            "home_points": [r["Home"] for r in pbp_rows],
             "current_set_number": len(completed_rows) + 1 if current_set else None,
             "current_set_away": current_set["Away"] if current_set else None,
             "current_set_home": current_set["Home"] if current_set else None,
@@ -2205,7 +2289,7 @@ def render_conference_standings(selected_sport, selected_conference=""):
 
 
 @st.fragment(run_every="30s")
-def live_dashboard(timezone_label, selected_timezone, sport_filter, close_thresholds, conference_filter, top25_only, date_offset, live_only, favorites_only, compact_mode, other_live_only):
+def live_dashboard(timezone_label, selected_timezone, sport_filter, close_thresholds, conference_filter, top25_only, date_offset, live_only, favorites_only, compact_mode, close_only):
     st.title("🏆 College Sports Live")
     selected_date = today_in_timezone(selected_timezone) + timedelta(days=date_offset)
     if date_offset == 0:
@@ -2222,7 +2306,7 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, close_thresh
         refresh_started = time.perf_counter()
         data = get_all_scoreboards(selected_timezone, selected_date, sport_filter)
         refresh_duration = time.perf_counter() - refresh_started
-        games = parse_games(data, selected_timezone, selected_date, fetch_volleyball_details=not other_live_only)
+        games = parse_games(data, selected_timezone, selected_date, fetch_volleyball_details=True)
         games = dedupe_games(games)
 
         # The NCAA football scoreboard can sometimes return the next slate of
@@ -2311,35 +2395,18 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, close_thresh
         return int(close_thresholds.get(game.get("sport"), 7))
     close_games = [g for g in live_games if g["diff"] <= close_limit(g)]
     other_live_games = [g for g in live_games if g["diff"] > close_limit(g)]
+    if close_only:
+        games = [g for g in games if g["state"] != "in" or g["diff"] <= close_limit(g)]
+        live_games = [g for g in games if g["state"] == "in"]
+        close_games = [g for g in live_games if g["diff"] <= close_limit(g)]
+        other_live_games = []
     favorite_games = [g for g in games if is_favorite(g, favorites)]
     live_sorted = sorted(live_games, key=lambda g: (g["diff"], g["event_time"] or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone))))
     final_sorted = sorted([g for g in games if g["state"] == "post"], key=lambda g: g["event_time"] or datetime.min.replace(tzinfo=ZoneInfo(selected_timezone)), reverse=True)
     upcoming_today = sorted([g for g in games if g["state"] == "pre"], key=lambda g: g["event_time"] or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone)))
 
-    c1,c2,c3,c4,c5,c6 = st.columns(6)
-    c1.metric("🔴 Live", len(live_games)); c2.metric("🔥 Close", len(close_games)); c3.metric("📺 Other Live", len(other_live_games)); c4.metric("⭐ My Teams", len(favorite_games)); c5.metric("🏆 Games", len(games)); c6.metric("🔔 Alerts", sum(bool(st.session_state.get(_alert_key(g["id"]), False)) for g in all_games_for_alerts))
-
-    if other_live_only:
-        st.info("📺 Other Live Games Only is on. Close, final, and upcoming sections are hidden, and extra volleyball detail requests are skipped for faster loading.")
-        st.markdown("---")
-        st.subheader("📺 Other Live Games")
-        other_live_sorted = sorted(
-            other_live_games,
-            key=lambda g: (g.get("event_time") or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone)), g.get("diff", 999))
-        )
-        if not other_live_sorted:
-            st.info("No other live games match the current filters.")
-        for i, game in enumerate(other_live_sorted):
-            render_alert_toggle(game, "other-live", i)
-            render_game(
-                {**game, "_render_context":"other-live"},
-                favorite=is_favorite(game, favorites),
-                close=False,
-                rankings=ranking_maps.get(game["sport"], {}),
-                records=record_maps.get(game["sport"], {}),
-                compact=compact_mode,
-            )
-        return
+    c1,c2,c3,c4,c5 = st.columns(5)
+    c1.metric("🔴 Live", len(live_games)); c2.metric("🔥 Close", len(close_games)); c3.metric("⭐ My Teams", len(favorite_games)); c4.metric("🏆 Games", len(games)); c5.metric("🔔 Alerts", sum(bool(st.session_state.get(_alert_key(g["id"]), False)) for g in all_games_for_alerts))
 
     st.markdown("---")
     st.subheader("⭐ My Teams")
@@ -2522,10 +2589,10 @@ with st.sidebar:
     conference_filter = st.multiselect("🏟️ Conferences", conference_options, default=[])
     top25_only = st.checkbox("🏆 Top 25 teams only", value=False)
     live_only = st.checkbox("🔴 Live games only", value=False)
-    other_live_only = st.checkbox(
-        "📺 Other live games only",
+    close_only = st.checkbox(
+        "🔥 Close games only",
         value=False,
-        help="Show only live games outside the close-game threshold. This also skips the extra volleyball set-detail requests for faster loading."
+        help="Show only live games that meet the close-game threshold. Final and upcoming games remain hidden."
     )
     favorites_only = st.checkbox("⭐ My Teams only", value=False)
     with st.expander("🔥 Close-game settings", expanded=False):
@@ -2570,5 +2637,5 @@ with st.sidebar:
 
 if not sport_filter:
     st.info("Select one or more sports in the sidebar to load scores. No score feeds are requested until you choose a sport.")
-live_dashboard(timezone_label, selected_timezone, sport_filter, close_thresholds, conference_filter, top25_only, date_offset, live_only, favorites_only, compact_mode, other_live_only)
+live_dashboard(timezone_label, selected_timezone, sport_filter, close_thresholds, conference_filter, top25_only, date_offset, live_only, favorites_only, compact_mode, close_only)
 
