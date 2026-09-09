@@ -1449,8 +1449,10 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, c
                         alert = bool(st.session_state.get(_alert_key(game["id"]), False))
                         alert_text = " • 🔔" if alert else ""
                         result_text = "vs" if is_home else "at"
-                        favorite_team_label = f"{favorite_name}{f' ({favorite_game_record})' if favorite_game_record else ''}"
-                        opponent_label = f"{opponent}{f' ({opponent_record})' if opponent_record else ''}"
+                        favorite_icon = "🏠" if is_home else "✈️"
+                        opponent_icon = "✈️" if is_home else "🏠"
+                        favorite_team_label = f"{favorite_name}{f' ({favorite_game_record})' if favorite_game_record else ''} {favorite_icon}"
+                        opponent_label = f"{opponent}{f' ({opponent_record})' if opponent_record else ''} {opponent_icon}"
                         game_rows.append(
                             f'<div class="myteam-game-row">'
                             f'<div class="myteam-status">{result_prefix + " • " if result_prefix else ""}{status}{alert_text} • {game["sport"]}</div>'
