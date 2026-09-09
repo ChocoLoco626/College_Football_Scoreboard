@@ -60,6 +60,13 @@ st.markdown("""
 .set-points { font-size:13px; font-weight:700; opacity:.72; }
 .vb-live-set { margin-top:8px; padding:7px 9px; border:1px solid rgba(49,130,96,.35); border-radius:6px; font-size:13px; font-weight:700; }
 .vb-live-team { margin-left:14px; }
+.vb-set-table { margin-top:9px; border:1px solid rgba(128,128,128,.35); border-radius:5px; overflow:hidden; font-size:12px; }
+.vb-set-label, .vb-set-row { display:grid; grid-template-columns:minmax(105px, 1fr) repeat(auto-fit, minmax(28px, 28px)) 32px; align-items:center; }
+.vb-set-label { background:rgba(128,128,128,.12); font-weight:800; text-align:center; }
+.vb-set-label span, .vb-set-row > span, .vb-set-row > b { padding:4px 3px; text-align:center; border-left:1px solid rgba(128,128,128,.22); }
+.vb-set-row { border-top:1px solid rgba(128,128,128,.22); }
+.vb-set-row strong { padding:4px 6px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.vb-set-row b { font-size:13px; }
 .team { font-size:18px; font-weight:700; margin:8px 0; min-height:38px; }
 .meta { color:#9ca3af; font-size:13px; }
 .update-bar { border:1px solid rgba(128,128,128,.30); border-radius:12px; padding:9px 12px; margin:8px 0 14px; font-size:13px; }
@@ -1408,7 +1415,7 @@ def _extract_current_volleyball_points(competitor, period_value=""):
 
 @st.cache_data(ttl=30, show_spinner=False)
 def get_espn_volleyball_scoreboard(target_date):
-    """Fetch ESPN women's college volleyball only as a fallback for live set points."""
+    """Fetch ESPN women's college volleyball as a low-cost fallback for set scores."""
     if not target_date:
         return None
     try:
@@ -1434,59 +1441,85 @@ def _team_names_match(name_a, name_b):
     return a == b or a in b or b in a
 
 
-def _extract_espn_current_vb_points(event, away_name, home_name):
-    """Extract ESPN's current in-progress volleyball set points."""
+def _espn_vb_linescores(competitor):
+    """Return ESPN volleyball per-set point values in set order."""
+    values = []
+    for row in competitor.get("linescores") or []:
+        if not isinstance(row, dict):
+            continue
+        raw = row.get("value", row.get("score", row.get("displayValue")))
+        try:
+            if isinstance(raw, str):
+                match = re.search(r"\d+", raw)
+                raw = match.group(0) if match else None
+            value = int(float(raw))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= value <= 60:
+            values.append(value)
+    return values
+
+
+def _espn_vb_current_set_number(event, count):
+    status = event.get("status", {}) if isinstance(event, dict) else {}
+    period = status.get("period")
+    if period is None:
+        period = status.get("type", {}).get("shortDetail", "")
+    try:
+        return max(1, min(int(period), count))
+    except (TypeError, ValueError):
+        match = re.search(r"(\d+)", str(period or ""))
+        if match:
+            return max(1, min(int(match.group(1)), count))
+        return count
+
+
+def _extract_espn_vb_scores(event, away_name, home_name):
+    """Return full ESPN set rows plus current-set data for a matching event."""
     if not isinstance(event, dict):
-        return None, None, None
+        return None
     competition = (event.get("competitions") or [{}])[0]
     competitors = competition.get("competitors") or []
     away = next((c for c in competitors if c.get("homeAway") == "away"), None)
     home = next((c for c in competitors if c.get("homeAway") == "home"), None)
     if not away or not home:
-        return None, None, None
-    if not (_team_names_match(away.get("team", {}).get("displayName"), away_name)
-            and _team_names_match(home.get("team", {}).get("displayName"), home_name)):
-        return None, None, None
+        return None
+    away_team = away.get("team", {}).get("displayName", "")
+    home_team = home.get("team", {}).get("displayName", "")
+    if not (_team_names_match(away_team, away_name) and _team_names_match(home_team, home_name)):
+        return None
 
-    def linescores(c):
-        values = []
-        for row in c.get("linescores") or []:
-            if not isinstance(row, dict):
-                continue
-            raw = row.get("value", row.get("score", row.get("displayValue")))
-            try:
-                if isinstance(raw, str) and "-" in raw:
-                    raw = raw.split("-")[-1]
-                value = int(float(raw))
-            except (TypeError, ValueError):
-                continue
-            values.append(value)
-        return values
-
-    away_sets = linescores(away)
-    home_sets = linescores(home)
-    if not away_sets or not home_sets:
-        return None, None, None
-
+    away_sets = _espn_vb_linescores(away)
+    home_sets = _espn_vb_linescores(home)
     count = min(len(away_sets), len(home_sets))
     if count == 0:
-        return None, None, None
-    period = event.get("status", {}).get("period") or event.get("status", {}).get("type", {}).get("shortDetail", "")
-    try:
-        set_no = int(period)
-    except (TypeError, ValueError):
-        set_no = count
-    set_no = max(1, min(set_no, count))
-    return away_sets[set_no - 1], home_sets[set_no - 1], set_no
+        return None
+
+    rows = [
+        {"Set": str(i + 1), "Away": away_sets[i], "Home": home_sets[i]}
+        for i in range(count)
+    ]
+    current_set = _espn_vb_current_set_number(event, count)
+    state = event.get("status", {}).get("type", {}).get("state", "")
+    if state == "post":
+        current_set = None
+        current_away = current_home = None
+    else:
+        current_away = away_sets[current_set - 1]
+        current_home = home_sets[current_set - 1]
+    return rows, current_set, current_away, current_home
 
 
 def apply_espn_volleyball_fallback(games, target_date):
-    """Fill only missing live volleyball point scores from ESPN."""
+    """Fill missing volleyball set history/current points from one cached ESPN feed."""
     targets = [
         g for g in games
         if g.get("sport") == "🏐 Women's Volleyball"
-        and g.get("state") == "in"
-        and (g.get("volleyball_current_away") is None or g.get("volleyball_current_home") is None)
+        and g.get("state") in ("in", "post")
+        and (
+            not g.get("volleyball_set_scores")
+            or (g.get("state") == "in" and (g.get("volleyball_current_away") is None or g.get("volleyball_current_home") is None))
+        )
     ]
     if not targets:
         return games
@@ -1497,12 +1530,27 @@ def apply_espn_volleyball_fallback(games, target_date):
     events = payload.get("events") or []
     for game in targets:
         for event in events:
-            away, home, set_no = _extract_espn_current_vb_points(event, game.get("away", ""), game.get("home", ""))
-            if away is None or home is None:
+            extracted = _extract_espn_vb_scores(event, game.get("away", ""), game.get("home", ""))
+            if not extracted:
                 continue
-            game["volleyball_current_away"] = away
-            game["volleyball_current_home"] = home
-            game["volleyball_current_set"] = set_no
+            rows, set_no, current_away, current_home = extracted
+            game["volleyball_set_scores"] = rows
+            game["away_points_by_set"] = [r["Away"] for r in rows]
+            game["home_points_by_set"] = [r["Home"] for r in rows]
+            if set_no is not None:
+                game["volleyball_current_set"] = set_no
+                game["volleyball_current_away"] = current_away
+                game["volleyball_current_home"] = current_home
+            # ESPN's linescore is also a reliable set-win count. For a live
+            # match, only completed sets count; for a final, every set counts.
+            if game.get("state") == "post":
+                game["away_score"] = sum(1 for r in rows if r["Away"] > r["Home"])
+                game["home_score"] = sum(1 for r in rows if r["Home"] > r["Away"])
+            else:
+                completed = rows[:-1] if len(rows) > 0 else []
+                game["away_score"] = sum(1 for r in completed if r["Away"] > r["Home"])
+                game["home_score"] = sum(1 for r in completed if r["Home"] > r["Away"])
+            game["diff"] = abs(int(game.get("away_score", 0)) - int(game.get("home_score", 0)))
             break
     return games
 
@@ -1845,6 +1893,23 @@ def _late_close_reason(game, close_thresholds):
     return False
 
 
+def _volleyball_set_scoreboard(game):
+    """Compact ESPN/NCAA-style set-by-set score table for volleyball cards."""
+    rows = game.get("volleyball_set_scores") or []
+    if not rows:
+        return ""
+    headers = "".join(f'<span>{r["Set"]}</span>' for r in rows)
+    away = "".join(f'<span>{r["Away"]}</span>' for r in rows)
+    home = "".join(f'<span>{r["Home"]}</span>' for r in rows)
+    return (
+        '<div class="vb-set-table">'
+        f'<div class="vb-set-label"><span></span>{headers}<span>T</span></div>'
+        f'<div class="vb-set-row"><strong>{game.get("away", "Away")}</strong>{away}<b>{game.get("away_score", 0)}</b></div>'
+        f'<div class="vb-set-row"><strong>{game.get("home", "Home")}</strong>{home}<b>{game.get("home_score", 0)}</b></div>'
+        '</div>'
+    )
+
+
 def render_game(game, favorite=False, close=False, rankings=None, records=None, compact=False):
     status_badge = "🔴 LIVE NOW" if game["state"] == "in" else ("FINAL" if game["state"] == "post" else "UPCOMING")
     live_detail = _live_status_text(game)
@@ -1903,6 +1968,7 @@ def render_game(game, favorite=False, close=False, rankings=None, records=None, 
       <div class="team">{away_logo}{away_label}{game['away']} ✈️<span class="score">{away_score}</span></div>
       <div class="team">{home_logo}{home_label}{game['home']} 🏠<span class="score">{home_score}</span></div>
       {_volleyball_live_tracker(game) if game.get("sport") == "🏐 Women's Volleyball" else ''}
+      {_volleyball_set_scoreboard(game) if game.get("sport") == "🏐 Women's Volleyball" else ''}
       <div class="meta">Score difference: {game['diff']}{' set' if game.get('sport') == "🏐 Women's Volleyball" and game['diff'] == 1 else (' sets' if game.get('sport') == "🏐 Women's Volleyball" else '')}{change_html}{clock}{start_meta}</div>
     </div>
     """, unsafe_allow_html=True)
@@ -2123,7 +2189,7 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, close_thresh
         refresh_started = time.perf_counter()
         data = get_all_scoreboards(selected_timezone, selected_date, sport_filter)
         refresh_duration = time.perf_counter() - refresh_started
-        games = parse_games(data, selected_timezone)
+        games = parse_games(data, selected_timezone, selected_date)
         games = dedupe_games(games)
 
         # The NCAA football scoreboard can sometimes return the next slate of
