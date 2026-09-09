@@ -1053,8 +1053,8 @@ def render_game(game, favorite=False, close=False, rankings=None, records=None, 
     st.markdown(f"""
     <div class="{card_class}">
       <div class="meta">{game['sport']} • {meta}</div>
-      <div class="team">{away_logo}{away_label}@ {game['away']}<span class="score">{away_score}</span></div>
-      <div class="team">{home_logo}{home_label}🏠 {game['home']}<span class="score">{home_score}</span></div>
+      <div class="team">{away_logo}{away_label}{game['away']} ✈️<span class="score">{away_score}</span></div>
+      <div class="team">{home_logo}{home_label}{game['home']} 🏠<span class="score">{home_score}</span></div>
       <div class="meta">Score difference: {game['diff']}{change_html}{clock}{start_meta}</div>
     </div>
     """, unsafe_allow_html=True)
