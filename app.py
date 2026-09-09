@@ -54,7 +54,8 @@ st.set_page_config(
 st.markdown("""
 <style>
 .game-card { border:1px solid rgba(128,128,128,.35); border-radius:14px; padding:15px 18px; margin:8px 0; }
-.score { font-size:30px; font-weight:800; float:right; }
+.score { font-size:30px; font-weight:800; float:right; text-align:right; }
+.set-points { font-size:13px; font-weight:700; opacity:.72; }
 .team { font-size:18px; font-weight:700; margin:8px 0; min-height:38px; }
 .meta { color:#9ca3af; font-size:13px; }
 .update-bar { border:1px solid rgba(128,128,128,.30); border-radius:12px; padding:9px 12px; margin:8px 0 14px; font-size:13px; }
@@ -410,6 +411,51 @@ def _extract_volleyball_set_scores(payload, away_id="", home_id=""):
 
     return []
 
+
+
+@st.cache_data(ttl=15)
+def get_volleyball_set_info(game_id, away_id="", home_id=""):
+    """Return volleyball set wins and points-per-set from NCAA game-center data."""
+    if not game_id or str(game_id).startswith("ncaa-"):
+        return None
+
+    payloads = []
+    for fetcher in (get_ncaa_game_detail, get_ncaa_boxscore):
+        try:
+            payload = fetcher(game_id)
+            if payload:
+                payloads.append(payload)
+        except Exception:
+            continue
+
+    for payload in payloads:
+        rows = _extract_volleyball_set_scores(payload, away_id, home_id)
+        if not rows:
+            continue
+        away_points = [r["Away"] for r in rows]
+        home_points = [r["Home"] for r in rows]
+        # Only count completed/scored sets. A partially populated set is ignored
+        # unless both sides have a numeric point total.
+        away_sets = sum(1 for a, h in zip(away_points, home_points) if a > h)
+        home_sets = sum(1 for a, h in zip(away_points, home_points) if h > a)
+        return {
+            "rows": rows,
+            "away_sets": away_sets,
+            "home_sets": home_sets,
+            "away_points": away_points,
+            "home_points": home_points,
+        }
+    return None
+
+
+def _volleyball_score_label(game, side):
+    """Format volleyball as sets first, then the points won in each set."""
+    sets = game.get(f"{side}_score")
+    points = game.get(f"{side}_points_by_set") or []
+    if game.get("sport") != "🏐 Women's Volleyball" or not points:
+        return str(sets) if sets not in (None, "") else "—"
+    point_text = ", ".join(str(p) for p in points)
+    return f'{sets} <span class="set-points">({point_text})</span>'
 
 def _ncaa_football_week(target_date):
     """Return the NCAA football scoreboard week containing target_date.
@@ -1098,6 +1144,23 @@ def parse_games(data, timezone_name):
             "tournament_name": event.get("_tournament_name", ""),
             "round_name": event.get("_round_name", ""),
         })
+    # Volleyball uses match sets as the primary score and points won in each
+    # set as the secondary score. Enrich only volleyball games; the game-center
+    # responses are cached for 15 seconds so the 30-second dashboard refresh
+    # stays lightweight.
+    for game in games:
+        if game.get("sport") != "🏐 Women's Volleyball" or game.get("state") not in ("in", "post"):
+            continue
+        info = get_volleyball_set_info(game.get("id"), game.get("away_id", ""), game.get("home_id", ""))
+        if not info:
+            continue
+        game["away_score"] = info["away_sets"]
+        game["home_score"] = info["home_sets"]
+        game["away_points_by_set"] = info["away_points"]
+        game["home_points_by_set"] = info["home_points"]
+        game["volleyball_set_scores"] = info["rows"]
+        game["diff"] = abs(info["away_sets"] - info["home_sets"])
+
     return games
 
 
@@ -1320,7 +1383,8 @@ def render_game(game, favorite=False, close=False, rankings=None, records=None, 
     home_label = ((f"#{home_rank} " if home_rank else "") + (f"({home_record}) " if home_record else ""))
 
     if game["state"] in ("in", "post"):
-        away_score, home_score = game["away_score"], game["home_score"]
+        away_score = _volleyball_score_label(game, "away")
+        home_score = _volleyball_score_label(game, "home")
     else:
         away_score = home_score = "—"
 
@@ -1345,7 +1409,7 @@ def render_game(game, favorite=False, close=False, rankings=None, records=None, 
       <div class="meta">{game['sport']} • {meta}{matchup_meta}</div>
       <div class="team">{away_logo}{away_label}{game['away']} ✈️<span class="score">{away_score}</span></div>
       <div class="team">{home_logo}{home_label}{game['home']} 🏠<span class="score">{home_score}</span></div>
-      <div class="meta">Score difference: {game['diff']}{change_html}{clock}{start_meta}</div>
+      <div class="meta">Score difference: {game['diff']}{' set' if game.get('sport') == "🏐 Women's Volleyball" and game['diff'] == 1 else (' sets' if game.get('sport') == "🏐 Women's Volleyball" else '')}{change_html}{clock}{start_meta}</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1719,10 +1783,16 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, close_thresh
                         result_prefix = ""
                         if game["state"] == "in":
                             status = "🔴 LIVE"
-                            score = f'{game["home_score"]}–{game["away_score"]}'
+                            if game.get("sport") == "🏐 Women's Volleyball":
+                                score = f'{_volleyball_score_label(game, "home")}–{_volleyball_score_label(game, "away")}'
+                            else:
+                                score = f'{game["home_score"]}–{game["away_score"]}'
                         elif game["state"] == "post":
                             status = "FINAL"
-                            score = f'{game["home_score"]}–{game["away_score"]}'
+                            if game.get("sport") == "🏐 Women's Volleyball":
+                                score = f'{_volleyball_score_label(game, "home")}–{_volleyball_score_label(game, "away")}'
+                            else:
+                                score = f'{game["home_score"]}–{game["away_score"]}'
                             fav_score = game["home_score"] if is_home else game["away_score"]
                             opp_score = game["away_score"] if is_home else game["home_score"]
                             try:
@@ -1821,7 +1891,7 @@ with st.sidebar:
     live_only = st.checkbox("🔴 Live games only", value=False)
     favorites_only = st.checkbox("⭐ My Teams only", value=False)
     with st.expander("🔥 Close-game settings", expanded=False):
-        st.caption("Set the score margin that counts as a close game for each sport. A game at the threshold is included.")
+        st.caption("Set the score margin that counts as a close game for each sport. Volleyball uses set margin; its points-per-set scores are shown separately. A game at the threshold is included.")
         close_thresholds = {}
         threshold_limits = {
             "🏈 Football": (1, 30),
