@@ -996,6 +996,107 @@ def render_conference_standings(selected_sport, selected_conference=""):
     st.dataframe(clean, use_container_width=True, hide_index=True)
 
 
+
+@st.fragment(run_every="30s")
+def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, conference_filter, top25_only, date_offset, live_only, favorites_only, standings_sport, standings_conference):
+    st.title("🏆 College Sports Live")
+    selected_date = today_in_timezone(selected_timezone) + timedelta(days=date_offset)
+    date_label = { -1: "Yesterday", 0: "Today", 1: "Tomorrow" }.get(date_offset, str(selected_date))
+    st.caption(f"NCAA college scores • {date_label} • Showing times in {timezone_label}")
+
+    try:
+        data = get_all_scoreboards(selected_timezone, selected_date)
+        games = parse_games(data, selected_timezone)
+
+        # The NCAA football scoreboard can sometimes return the next slate of
+        # games even when a specific date was requested. Never let those
+        # future games leak into the selected date. Use the actual parsed
+        # local event date as the source of truth.
+        games = [g for g in games if g.get("event_date") == selected_date]
+    except Exception as exc:
+        st.error(f"Could not retrieve scores: {type(exc).__name__}: {exc}")
+        st.stop()
+
+    all_games_for_alerts = list(games)
+    flashes = update_score_alerts(all_games_for_alerts)
+    if flashes:
+        inject_flash_css()
+        names = " • ".join(_game_label(g) for g in flashes[:4])
+        st.markdown(f'<div class="scoreboard-flash">🚨 SCORE ALERT 🚨<br>{names}</div>', unsafe_allow_html=True)
+
+    if show_diagnostics:
+        with st.expander("🛠️ Scoreboard Diagnostics", expanded=True):
+            st.write({"selected_time_zone": timezone_label, "selected_date": str(selected_date), "raw_combined_event_count": len(data.get("events", [])), "parsed_game_count": len(games), "errors": data.get("errors", [])})
+            for diag in data.get("diagnostics", []):
+                with st.container(border=True):
+                    st.markdown(f"**{diag.get('sport','Unknown sport')}**")
+                    st.write({k:v for k,v in diag.items() if k not in {"sample_games"}})
+                    if diag.get("sample_games"): st.json(diag["sample_games"][:10])
+
+    selected = set(sport_filter)
+    if selected:
+        games = [g for g in games if g["sport"] in selected]
+
+    ranking_maps = get_inline_ranking_maps()
+    record_maps = get_record_maps_for_games(games)
+    if conference_filter:
+        selected_conferences = set(conference_filter)
+        games = [g for g in games if g.get("away_conference") in selected_conferences or g.get("home_conference") in selected_conferences]
+    if top25_only:
+        games = [g for g in games if ranking_maps.get(g["sport"], {}).get(_normalize_team_name(g["away"])) or ranking_maps.get(g["sport"], {}).get(_normalize_team_name(g["home"]))]
+
+    favorites = st.session_state.favorites
+    if live_only:
+        games = [g for g in games if g["state"] == "in"]
+    if favorites_only:
+        games = [g for g in games if is_favorite(g, favorites)]
+
+    live_games = [g for g in games if g["state"] == "in"]
+    close_games = [g for g in live_games if g["diff"] < threshold]
+    favorite_games = [g for g in games if is_favorite(g, favorites)]
+    live_sorted = sorted(live_games, key=lambda g: (g["diff"], g["event_time"] or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone))))
+    final_sorted = sorted([g for g in games if g["state"] == "post"], key=lambda g: g["event_time"] or datetime.min.replace(tzinfo=ZoneInfo(selected_timezone)), reverse=True)
+    upcoming_today = sorted([g for g in games if g["state"] == "pre"], key=lambda g: g["event_time"] or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone)))
+
+    c1,c2,c3,c4,c5 = st.columns(5)
+    c1.metric("🔴 Live", len(live_games)); c2.metric(f"🔥 Under {threshold}", len(close_games)); c3.metric("⭐ My Teams", len(favorite_games)); c4.metric("🏆 Games", len(games)); c5.metric("🔔 Alerts", sum(bool(st.session_state.get(_alert_key(g["id"]), False)) for g in all_games_for_alerts))
+
+    st.markdown("---")
+    st.subheader("⭐ My Teams")
+    if favorite_games:
+        for favorite_name, favorite_id in favorites.items():
+            team_games = [g for g in games if is_favorite(g, {favorite_name: favorite_id})]
+            st.markdown(f"### ⭐ {favorite_name}")
+            if not team_games: st.caption("No games found for this date.")
+            else:
+                for game in sorted(team_games, key=lambda g: (g["state"] != "in", g["event_time"] or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone)))):
+                    alert = bool(st.session_state.get(_alert_key(game["id"]), False))
+                    st.caption("🔔 Flash alert enabled" if alert else "")
+                    render_game({**game, "_render_context":"myteams"}, favorite=True, close=(game["state"]=="in" and game["diff"]<threshold), rankings=ranking_maps.get(game["sport"], {}), records=record_maps.get(game["sport"], {}))
+    else:
+        st.info("Select teams in the sidebar to build your My Teams dashboard.")
+
+    st.markdown("---")
+    st.subheader("🏆 Games — Sorted by Closeness")
+    for game in live_sorted + final_sorted:
+        context = "main"
+        render_alert_toggle(game, context)
+        render_game({**game, "_render_context":context}, favorite=is_favorite(game, favorites), close=(game["state"]=="in" and game["diff"]<threshold), rankings=ranking_maps.get(game["sport"], {}), records=record_maps.get(game["sport"], {}))
+    if not (live_sorted or final_sorted): st.info("No live or completed games match the current filters.")
+
+    st.markdown("---")
+    st.subheader("📅 Upcoming")
+    if not upcoming_today: st.info("No upcoming games match the current filters.")
+    for game in upcoming_today:
+        render_alert_toggle(game, "upcoming")
+        render_game({**game, "_render_context":"upcoming"}, favorite=is_favorite(game, favorites), close=False, rankings=ranking_maps.get(game["sport"], {}), records=record_maps.get(game["sport"], {}))
+
+    st.markdown("---")
+    st.subheader("📊 Conference Standings")
+    st.caption("NCAA conference standings for the selected sport.")
+    render_conference_standings(standings_sport, standings_conference)
+
+
 # Sidebar controls
 with st.sidebar:
     st.header("⚙️ Settings")
