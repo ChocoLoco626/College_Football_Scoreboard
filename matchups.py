@@ -306,4 +306,13 @@ def format_matchup_badges(game):
     for item in (primary, secondary):
         if item:
             badges.append(f"{item['icon']} {str(item['type']).upper()} • {item['name']}")
+
+    # A conference matchup is any game between two teams currently identified
+    # with the same conference. Keep Independent vs. Independent out of this tag.
+    away_conf = str(game.get("away_conference") or "").strip()
+    home_conf = str(game.get("home_conference") or "").strip()
+    if away_conf and home_conf and away_conf.lower() not in {"independent", "independents"} and home_conf.lower() not in {"independent", "independents"}:
+        normalize = lambda value: " ".join(value.lower().replace("&", "and").replace(".", "").split())
+        if normalize(away_conf) == normalize(home_conf):
+            badges.append(f"🏟️ CONFERENCE • {away_conf}")
     return badges

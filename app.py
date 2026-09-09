@@ -23,6 +23,19 @@ SPORTS = {
     "🥎 Softball": [],
 }
 
+# Sport-specific close-game defaults. A 7-point football game is close,
+# while a 7-goal soccer game clearly is not. Values are score-margin points/goals.
+DEFAULT_CLOSE_THRESHOLDS = {
+    "🏈 Football": 7,
+    "⚽ Men's Soccer": 1,
+    "⚽ Women's Soccer": 1,
+    "🏀 Men's Basketball": 7,
+    "🏀 Women's Basketball": 7,
+    "🏐 Women's Volleyball": 2,
+    "⚾ Baseball": 2,
+    "🥎 Softball": 2,
+}
+
 DEFAULT_FAVORITES = {"Kentucky": "96", "Auburn": "2", "West Florida": "2908"}
 TEAM_IDS = {
     "Kentucky": "96", "Auburn": "2", "West Florida": "2908", "Alabama": "333",
@@ -918,6 +931,17 @@ def _pretty_conference(value):
     return labels.get(key, str(value).strip())
 
 
+def _conference_matchup_badge(game):
+    """Return a conference-matchup badge when both teams share a conference."""
+    away_conf = _pretty_conference(game.get("away_conference", ""))
+    home_conf = _pretty_conference(game.get("home_conference", ""))
+    if not away_conf or not home_conf:
+        return ""
+    if away_conf.lower() in {"independent", "independents"} or home_conf.lower() in {"independent", "independents"}:
+        return ""
+    if _normalize_team_name(away_conf) == _normalize_team_name(home_conf):
+        return f"🏟️ CONFERENCE • {away_conf}"
+    return ""
 
 
 def _format_record_value(value):
@@ -1524,7 +1548,7 @@ def render_conference_standings(selected_sport, selected_conference=""):
 
 
 @st.fragment(run_every="30s")
-def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, conference_filter, top25_only, date_offset, live_only, favorites_only, compact_mode):
+def live_dashboard(timezone_label, selected_timezone, sport_filter, close_thresholds, conference_filter, top25_only, date_offset, live_only, favorites_only, compact_mode):
     st.title("🏆 College Sports Live")
     selected_date = today_in_timezone(selected_timezone) + timedelta(days=date_offset)
     if date_offset == 0:
@@ -1624,14 +1648,16 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, c
         games = [g for g in games if is_favorite(g, favorites)]
 
     live_games = [g for g in games if g["state"] == "in"]
-    close_games = [g for g in live_games if g["diff"] < threshold]
+    def close_limit(game):
+        return int(close_thresholds.get(game.get("sport"), 7))
+    close_games = [g for g in live_games if g["diff"] <= close_limit(g)]
     favorite_games = [g for g in games if is_favorite(g, favorites)]
     live_sorted = sorted(live_games, key=lambda g: (g["diff"], g["event_time"] or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone))))
     final_sorted = sorted([g for g in games if g["state"] == "post"], key=lambda g: g["event_time"] or datetime.min.replace(tzinfo=ZoneInfo(selected_timezone)), reverse=True)
     upcoming_today = sorted([g for g in games if g["state"] == "pre"], key=lambda g: g["event_time"] or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone)))
 
     c1,c2,c3,c4,c5 = st.columns(5)
-    c1.metric("🔴 Live", len(live_games)); c2.metric(f"🔥 Under {threshold}", len(close_games)); c3.metric("⭐ My Teams", len(favorite_games)); c4.metric("🏆 Games", len(games)); c5.metric("🔔 Alerts", sum(bool(st.session_state.get(_alert_key(g["id"]), False)) for g in all_games_for_alerts))
+    c1.metric("🔴 Live", len(live_games)); c2.metric("🔥 Close", len(close_games)); c3.metric("⭐ My Teams", len(favorite_games)); c4.metric("🏆 Games", len(games)); c5.metric("🔔 Alerts", sum(bool(st.session_state.get(_alert_key(g["id"]), False)) for g in all_games_for_alerts))
 
     st.markdown("---")
     st.subheader("⭐ My Teams")
@@ -1746,6 +1772,8 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, c
     close_sorted = sorted(close_games, key=lambda g: (g["diff"], g.get("event_time") or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone))))
     if not close_sorted:
         st.info("No close live games match the current filters.")
+    elif len({close_limit(g) for g in close_sorted}) > 1:
+        st.caption("Sport-specific close-game thresholds are applied.")
     for i, game in enumerate(close_sorted):
         context = "main"
         render_alert_toggle(game, context, i)
@@ -1792,7 +1820,26 @@ with st.sidebar:
     top25_only = st.checkbox("🏆 Top 25 teams only", value=False)
     live_only = st.checkbox("🔴 Live games only", value=False)
     favorites_only = st.checkbox("⭐ My Teams only", value=False)
-    threshold = st.slider("Close-game threshold", min_value=1, max_value=20, value=7)
+    with st.expander("🔥 Close-game settings", expanded=False):
+        st.caption("Set the score margin that counts as a close game for each sport. A game at the threshold is included.")
+        close_thresholds = {}
+        threshold_limits = {
+            "🏈 Football": (1, 30),
+            "⚽ Men's Soccer": (1, 10),
+            "⚽ Women's Soccer": (1, 10),
+            "🏀 Men's Basketball": (1, 20),
+            "🏀 Women's Basketball": (1, 20),
+            "🏐 Women's Volleyball": (1, 10),
+            "⚾ Baseball": (1, 10),
+            "🥎 Softball": (1, 10),
+        }
+        for sport_name in SPORTS:
+            low, high = threshold_limits[sport_name]
+            close_thresholds[sport_name] = st.slider(
+                sport_name, min_value=low, max_value=high,
+                value=DEFAULT_CLOSE_THRESHOLDS[sport_name],
+                key=f"close_threshold_{sport_name}",
+            )
     compact_mode = st.checkbox("📱 Compact scoreboard", value=False, help="Tighten cards and spacing so more games fit on screen.")
 
     st.markdown("---")
@@ -1813,5 +1860,5 @@ with st.sidebar:
         get_all_scoreboards.clear()
         st.rerun()
 
-live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, conference_filter, top25_only, date_offset, live_only, favorites_only, compact_mode)
+live_dashboard(timezone_label, selected_timezone, sport_filter, close_thresholds, conference_filter, top25_only, date_offset, live_only, favorites_only, compact_mode)
 
