@@ -47,6 +47,13 @@ st.markdown("""
 .update-good { color:#22c55e; font-weight:700; }
 .update-warn { color:#eab308; font-weight:700; }
 .update-bad { color:#ef4444; font-weight:700; }
+.myteam-card { border:1px solid rgba(128,128,128,.30); border-radius:12px; padding:11px 13px; margin:5px 0 10px; min-height:112px; }
+.myteam-name { font-size:16px; font-weight:800; margin-bottom:4px; }
+.myteam-status { font-size:12px; color:#9ca3af; margin-bottom:7px; }
+.myteam-score { font-size:22px; font-weight:850; line-height:1.1; }
+.myteam-opponent { font-size:13px; margin-top:4px; }
+.history-row { border-bottom:1px solid rgba(128,128,128,.18); padding:7px 0; font-size:13px; }
+.history-time { color:#9ca3af; font-size:11px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1045,23 +1052,81 @@ def render_alert_toggle(game, context, instance=0):
     return value
 
 
-def update_score_alerts(all_games):
+def update_score_alerts(all_games, previous_snapshots=None):
     """Detect score/state changes for games the user has marked for alerts."""
-    previous = st.session_state.setdefault("previous_game_snapshots", {})
+    previous = previous_snapshots if previous_snapshots is not None else st.session_state.get("previous_game_snapshots", {})
     flashes = []
-    current = {}
     for game in all_games:
         gid = str(game.get("id"))
         snapshot = (game.get("away_score", 0), game.get("home_score", 0), game.get("state"), game.get("period", ""), game.get("clock", ""))
-        current[gid] = snapshot
         if st.session_state.get(_alert_key(gid), False):
             old = previous.get(gid)
             if old is not None and old != snapshot and (
                 old[0] != snapshot[0] or old[1] != snapshot[1] or old[2] != snapshot[2]
             ):
                 flashes.append(game)
-    st.session_state.previous_game_snapshots = current
     return flashes
+
+
+def update_score_history(all_games, timezone_name, max_entries=12):
+    """Keep a short session-local log of score/state changes, newest first."""
+    previous = st.session_state.setdefault("previous_game_snapshots", {})
+    history = st.session_state.setdefault("score_change_history", [])
+    current = {}
+    changes = []
+
+    for game in all_games:
+        gid = str(game.get("id") or "")
+        if not gid:
+            continue
+        snapshot = (
+            game.get("away_score", 0),
+            game.get("home_score", 0),
+            game.get("state"),
+            game.get("period", ""),
+            game.get("clock", ""),
+        )
+        current[gid] = snapshot
+        old = previous.get(gid)
+        if old is not None and old != snapshot and (
+            old[0] != snapshot[0] or old[1] != snapshot[1] or old[2] != snapshot[2]
+        ):
+            if snapshot[2] == "post":
+                change = "Final"
+            elif snapshot[2] == "in" and old[2] == "pre":
+                change = "Game started"
+            elif snapshot[0] != old[0] or snapshot[1] != old[1]:
+                change = f"Score changed to {snapshot[0]}–{snapshot[1]}"
+            else:
+                change = "Game status changed"
+            changes.append({
+                "game_id": gid,
+                "away": game.get("away", "Away"),
+                "home": game.get("home", "Home"),
+                "sport": game.get("sport", "College Sports"),
+                "change": change,
+                "away_score": snapshot[0],
+                "home_score": snapshot[1],
+                "timestamp": datetime.now(ZoneInfo(timezone_name)).strftime("%I:%M:%S %p").lstrip("0"),
+            })
+
+    if changes:
+        history = changes + history
+        st.session_state.score_change_history = history[:max_entries]
+    st.session_state.previous_game_snapshots = current
+    return st.session_state.score_change_history
+
+
+def render_score_history(history):
+    if not history:
+        st.caption("No score changes detected yet. The history fills in as the scoreboard refreshes.")
+        return
+    for item in history[:12]:
+        st.markdown(
+            f'<div class="history-row"><b>{item["away"]} {item["away_score"]}–{item["home_score"]} {item["home"]}</b><br>'
+            f'<span class="history-time">{item["timestamp"]} • {item["sport"]} • {item["change"]}</span></div>',
+            unsafe_allow_html=True,
+        )
 
 
 def inject_flash_css():
@@ -1202,7 +1267,9 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, c
         st.stop()
 
     all_games_for_alerts = list(games)
-    flashes = update_score_alerts(all_games_for_alerts)
+    previous_snapshots = dict(st.session_state.get("previous_game_snapshots", {}))
+    history = update_score_history(all_games_for_alerts, selected_timezone)
+    flashes = update_score_alerts(all_games_for_alerts, previous_snapshots)
     if flashes:
         inject_flash_css()
         names = " • ".join(_game_label(g) for g in flashes[:4])
@@ -1247,20 +1314,50 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, c
 
     st.markdown("---")
     st.subheader("⭐ My Teams")
-    if favorite_games:
-        for favorite_name, favorite_id in favorites.items():
-            team_games = [g for g in games if is_favorite(g, {favorite_name: favorite_id})]
-            st.markdown(f"### ⭐ {favorite_name}")
-            if not team_games: st.caption("No games found for this date.")
-            else:
-                for game in sorted(team_games, key=lambda g: (g["state"] != "in", g["event_time"] or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone)))):
+    if favorites:
+        favorite_items = list(favorites.items())
+        columns_per_row = 3
+        for row_start in range(0, len(favorite_items), columns_per_row):
+            row = favorite_items[row_start:row_start + columns_per_row]
+            cols = st.columns(columns_per_row)
+            for col, (favorite_name, favorite_id) in zip(cols, row):
+                with col:
+                    team_games = [g for g in games if is_favorite(g, {favorite_name: favorite_id})]
+                    if not team_games:
+                        st.markdown(
+                            f'<div class="myteam-card"><div class="myteam-name">⭐ {favorite_name}</div>'
+                            f'<div class="myteam-status">No game on this date</div>'
+                            f'<div class="myteam-opponent">—</div></div>', unsafe_allow_html=True)
+                        continue
+                    game = sorted(team_games, key=lambda g: (g["state"] != "in", g["event_time"] or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone))))[0]
+                    home = _normalize_team_name(game["home"]) in {_normalize_team_name(favorite_name)} | {_normalize_team_name(a) for a in FAVORITE_NAME_ALIASES.get(favorite_name, set())}
+                    opponent = game["away"] if home else game["home"]
+                    if game["state"] == "in":
+                        status = "🔴 LIVE"
+                        score = f'{game["home_score"]}–{game["away_score"]}'
+                    elif game["state"] == "post":
+                        status = "FINAL"
+                        score = f'{game["home_score"]}–{game["away_score"]}'
+                    else:
+                        status = game.get("event_time").strftime("%I:%M %p").lstrip("0") if game.get("event_time") else "UPCOMING"
+                        score = "—"
                     alert = bool(st.session_state.get(_alert_key(game["id"]), False))
-                    st.caption("🔔 Flash alert enabled" if alert else "")
-                    render_game({**game, "_render_context":"myteams"}, favorite=True, close=(game["state"]=="in" and game["diff"]<threshold), rankings=ranking_maps.get(game["sport"], {}), records=record_maps.get(game["sport"], {}))
+                    alert_text = " • 🔔 Alert" if alert else ""
+                    result_text = "vs" if home else "at"
+                    st.markdown(
+                        f'<div class="myteam-card"><div class="myteam-name">⭐ {favorite_name}</div>'
+                        f'<div class="myteam-status">{status}{alert_text} • {game["sport"]}</div>'
+                        f'<div class="myteam-score">{score}</div>'
+                        f'<div class="myteam-opponent">{result_text} {opponent}</div></div>',
+                        unsafe_allow_html=True,
+                    )
     else:
         st.info("Select teams in the sidebar to build your My Teams dashboard.")
 
     st.markdown("---")
+    with st.expander("📈 Score Change History", expanded=False):
+        render_score_history(history)
+
     st.subheader("🏆 Games — Sorted by Closeness")
     for i, game in enumerate(live_sorted + final_sorted):
         context = "main"
@@ -1314,8 +1411,10 @@ with st.sidebar:
     st.caption("Use the 🔔 Flash alerts checkbox on a game card. Marked games flash on screen when their score changes.")
     show_diagnostics = st.checkbox("Show diagnostics", value=False)
 
+    st.caption("Scores refresh quietly every 30 seconds. Manual refresh only refreshes the NCAA score feeds, leaving rankings and logos cached.")
     if st.button("🔄 Refresh now", use_container_width=True):
-        st.cache_data.clear(); st.rerun()
+        get_all_scoreboards.clear()
+        st.rerun()
 
 live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, conference_filter, top25_only, date_offset, live_only, favorites_only)
 
