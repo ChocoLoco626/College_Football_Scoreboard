@@ -338,10 +338,19 @@ def _extract_volleyball_set_scores(payload, away_id="", home_id=""):
     # Most NCAA game-center variants expose period/line/set scores somewhere in
     # a list. We inspect several naming variants because the upstream GraphQL
     # schema has changed between API releases.
+    # Normalize these names the same way we normalize incoming JSON keys.
+    # The NCAA game-center has used both camelCase and snake_case names over
+    # time (for example setScores / set_scores / periodScores).
     candidate_keys = {
-        "sets", "setsscores", "setscores", "setscore", "periods", "periodscores",
-        "periodscore", "linescores", "linescore", "scoresbyset", "scorebyset",
-        "scoresbyperiod", "scorebyperiod", "periodscores",
+        key.replace("_", "").replace("-", "").lower()
+        for key in (
+            "sets", "setScores", "setScore", "periods", "periodScores",
+            "periodScore", "lineScores", "lineScore", "scoresBySet",
+            "scoreBySet", "scoresByPeriod", "scoreByPeriod",
+            "set_scores", "set_score", "period_scores", "period_score",
+            "line_scores", "line_score", "scores_by_set", "score_by_set",
+            "scores_by_period", "score_by_period",
+        )
     }
 
     def parse_score_pair(value):
@@ -396,6 +405,42 @@ def _extract_volleyball_set_scores(payload, away_id="", home_id=""):
                         rows.append({"Set": str(label), "Away": a, "Home": h})
             if rows:
                 return rows
+
+    # Some NCAA game-center responses put the per-set values directly on
+    # each team as period1/period2/... (or set1/set2/...). Reconstruct the
+    # paired rows from the away/home team objects when that shape is used.
+    team_period_maps = []
+    for obj in _walk_json(payload):
+        if not isinstance(obj, dict):
+            continue
+        team = obj.get("team") if isinstance(obj.get("team"), dict) else obj
+        team_id = str(team.get("id") or obj.get("teamId") or "")
+        if not team_id and not (team.get("name") or team.get("displayName")):
+            continue
+        period_map = {}
+        for key, value in obj.items():
+            nk = key_norm(key)
+            m = re.match(r"(?:set|period|game)0*(\d+)(?:score|points)?$", nk)
+            if not m:
+                continue
+            n = int(m.group(1))
+            score = _first_number(value)
+            if score is not None and 0 <= score <= 60:
+                period_map[n] = score
+        if period_map:
+            team_period_maps.append((team_id, period_map))
+
+    if len(team_period_maps) >= 2:
+        away_map = next((m for tid, m in team_period_maps if tid == str(away_id)), None)
+        home_map = next((m for tid, m in team_period_maps if tid == str(home_id)), None)
+        if away_map is None or home_map is None:
+            away_map, home_map = team_period_maps[0][1], team_period_maps[1][1]
+        rows = [
+            {"Set": str(i), "Away": away_map[i], "Home": home_map[i]}
+            for i in sorted(set(away_map) & set(home_map))
+        ]
+        if rows:
+            return rows
 
     # Generic fallback: NCAA game-center responses can expose volleyball
     # periods/sets under sport-specific names. Look for any nested objects that
