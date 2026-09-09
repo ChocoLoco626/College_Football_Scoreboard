@@ -72,7 +72,8 @@ def get_ncaa_volleyball_scoreboard(timezone_name):
     payload = response.json()
 
     events = []
-    for item in payload.get("games", []):
+    raw_games = payload.get("games", []) if isinstance(payload, dict) else []
+    for item in raw_games:
         game = item.get("game", item) if isinstance(item, dict) else {}
         if not isinstance(game, dict):
             continue
@@ -124,7 +125,23 @@ def get_ncaa_volleyball_scoreboard(timezone_name):
             "_league": "womens-college-volleyball",
             "_division": "NCAA D-I",
         })
-    return {"events": events}
+    return {"events": events, "_diagnostic": {
+        "source": "NCAA D-I volleyball",
+        "url": url,
+        "payload_type": type(payload).__name__,
+        "payload_keys": list(payload.keys()) if isinstance(payload, dict) else [],
+        "raw_game_count": len(raw_games),
+        "parsed_event_count": len(events),
+        "sample_raw_keys": [list(x.keys()) if isinstance(x, dict) else type(x).__name__ for x in raw_games[:5]],
+        "sample_games": [
+            {
+                "away": ((x.get("game", x) or {}).get("away", {}) or {}).get("names", {}) if isinstance(x, dict) else {},
+                "home": ((x.get("game", x) or {}).get("home", {}) or {}).get("names", {}) if isinstance(x, dict) else {},
+                "startTime": ((x.get("game", x) or {}).get("startTime") if isinstance(x, dict) else None),
+                "gameState": ((x.get("game", x) or {}).get("gameState") if isinstance(x, dict) else None),
+            } for x in raw_games[:5]
+        ],
+    }}
 
 
 def get_scoreboard(sport, league, group=None, timezone_name=TIMEZONES[DEFAULT_TIMEZONE]):
@@ -163,6 +180,12 @@ def get_scoreboard(sport, league, group=None, timezone_name=TIMEZONES[DEFAULT_TI
 
     merged_events = {}
     last_data = {"events": []}
+    diagnostics = {
+        "source": f"ESPN {sport}/{league}",
+        "url": url,
+        "requests": [],
+        "merged_event_count": 0,
+    }
     for date_value in date_windows:
         for variant in request_variants:
             params = {**variant, "dates": date_value}
@@ -173,6 +196,13 @@ def get_scoreboard(sport, league, group=None, timezone_name=TIMEZONES[DEFAULT_TI
             response.raise_for_status()
             data = response.json()
             last_data = data
+            diagnostics["requests"].append({
+                "dates": date_value,
+                "params": params,
+                "http_status": response.status_code,
+                "event_count": len(data.get("events", [])),
+                "top_keys": list(data.keys())[:20] if isinstance(data, dict) else [],
+            })
             for event in data.get("events", []):
                 event_id = str(event.get("id", ""))
                 if event_id:
@@ -192,13 +222,17 @@ def get_scoreboard(sport, league, group=None, timezone_name=TIMEZONES[DEFAULT_TI
             if event_id:
                 merged_events[event_id] = event
 
-    return {"events": list(merged_events.values())} if merged_events else last_data
+    diagnostics["merged_event_count"] = len(merged_events)
+    result = {"events": list(merged_events.values())} if merged_events else last_data
+    result["_diagnostic"] = diagnostics
+    return result
 
 
 @st.cache_data(ttl=20)
 def get_all_scoreboards(timezone_name):
     combined = []
     errors = []
+    diagnostics = []
     for sport_name, configs in SPORTS.items():
         for sport, league, division, group in configs:
             try:
@@ -206,6 +240,8 @@ def get_all_scoreboards(timezone_name):
                     data = get_ncaa_volleyball_scoreboard(timezone_name)
                 else:
                     data = get_scoreboard(sport, league, group, timezone_name)
+                if data.get("_diagnostic"):
+                    diagnostics.append({"sport": sport_name, **data["_diagnostic"]})
                 for event in data.get("events", []):
                     event["_sport_name"] = sport_name
                     event["_sport"] = sport
@@ -214,7 +250,7 @@ def get_all_scoreboards(timezone_name):
                     combined.append(event)
             except requests.RequestException as exc:
                 errors.append(f"{sport_name}: {exc}")
-    return {"events": combined, "errors": errors}
+    return {"events": combined, "errors": errors, "diagnostics": diagnostics}
 
 
 def parse_games(data, timezone_name):
