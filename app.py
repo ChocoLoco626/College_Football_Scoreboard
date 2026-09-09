@@ -10,7 +10,7 @@ TIMEZONES = {
     "Eastern Time": "America/New_York",
     "Central Time": "America/Chicago",
 }
-DEFAULT_TIMEZONE = "Eastern Time"
+DEFAULT_TIMEZONE = "Central Time"
 
 SPORTS = {
     "🏈 Football": [],
@@ -430,11 +430,30 @@ def get_ncaa_scoreboard(sport_slug, division, sport_name, timezone_name, target_
         date_path = local_date.strftime("%Y/%m/%d")
     url = f"https://ncaa-api.henrygd.me/scoreboard/{sport_slug}/{division}/{date_path}"
 
-    response = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-    response.raise_for_status()
-    payload = response.json()
+    # The public NCAA API supports pagination. Some busy dates can place a
+    # matchup on a later page, so fetch additional pages when the first page
+    # is full. This prevents marquee games (for example Kentucky-Louisville)
+    # from disappearing simply because the slate is large.
+    payload = None
+    raw_games = []
+    page = 1
+    max_pages = 5
+    while page <= max_pages:
+        page_url = url if page == 1 else f"{url}?page={page}"
+        response = requests.get(page_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        response.raise_for_status()
+        page_payload = response.json()
+        if not isinstance(page_payload, dict):
+            break
+        page_games = page_payload.get("games", []) or []
+        if page == 1:
+            payload = page_payload
+        raw_games.extend(page_games)
+        # NCAA returns a bounded page. If it is not full, there is no next page.
+        if len(page_games) < 20:
+            break
+        page += 1
 
-    raw_games = payload.get("games", []) if isinstance(payload, dict) else []
     events = []
     try:
         school_index = get_ncaa_schools_index()
@@ -568,6 +587,7 @@ def get_ncaa_scoreboard(sport_slug, division, sport_name, timezone_name, target_
             "sport": sport_slug,
             "division": division,
             "raw_game_count": len(raw_games),
+            "pages_fetched": page,
             "parsed_event_count": len(events),
             "sample_games": [
                 {
@@ -611,10 +631,19 @@ def get_all_scoreboards(timezone_name, target_date=None):
     for sport_name, configs in NCAA_SPORTS.items():
         for sport_slug, division in configs:
             # Football endpoints are week-based; get_ncaa_scoreboard()
-            # resolves the selected date to the correct NCAA week. Do not
-            # fetch target_date + 1 separately because that can return the
-            # same week twice.
-            dates_to_fetch = [target_date]
+            # resolves the selected date to the correct NCAA week, so adjacent
+            # calendar pages are unnecessary there. For date-based sports, the
+            # NCAA scoreboard calendar is effectively Eastern-time based. When
+            # the app is displaying Central Time, a late-night game can cross
+            # midnight during conversion (for example, 12:15 AM ET becomes
+            # 11:15 PM CT on the previous local date). Search the adjacent NCAA
+            # date pages automatically so those games are not lost.
+            if sport_slug == "football":
+                dates_to_fetch = [target_date]
+            elif timezone_name == "America/Chicago":
+                dates_to_fetch = [target_date - timedelta(days=1), target_date, target_date + timedelta(days=1)]
+            else:
+                dates_to_fetch = [target_date]
             seen_ids = set()
             for fetch_date in dates_to_fetch:
                 try:
@@ -627,6 +656,10 @@ def get_all_scoreboards(timezone_name, target_date=None):
                         })
                     for event in data.get("events", []):
                         event["_sport_name"] = sport_name
+                        # Keep the NCAA source date for diagnostics/debugging,
+                        # while parse_games() continues to use the converted
+                        # local event timestamp as the final date filter.
+                        event["_requested_ncaa_date"] = str(fetch_date)
                         event_id = str(event.get("id", ""))
                         if event_id and event_id in seen_ids:
                             continue
