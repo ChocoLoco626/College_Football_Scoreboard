@@ -63,7 +63,8 @@ def get_scoreboard(sport, league, group=None, timezone_name=TIMEZONES[DEFAULT_TI
     rather than volleyball having special-case behavior.
     """
     url = f"{ESPN_BASE}/{sport}/{league}/scoreboard"
-    today = today_in_timezone(selected_timezone)
+    today = today_in_timezone(timezone_name)
+    yesterday = today - timedelta(days=1)
     tomorrow = today + timedelta(days=1)
     today_str = today.strftime("%Y%m%d")
     window_str = f"{today_str}-{tomorrow.strftime('%Y%m%d')}"
@@ -72,20 +73,46 @@ def get_scoreboard(sport, league, group=None, timezone_name=TIMEZONES[DEFAULT_TI
     if group is not None:
         base_params["groups"] = str(group)
 
-    # First request: exact ESPN-local current day.
-    params = {**base_params, "dates": today_str}
-    response = requests.get(url, params=params, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
-    response.raise_for_status()
-    data = response.json()
-    if data.get("events"):
-        return data
+    # ESPN's college volleyball feed can be inconsistent about which calendar
+    # date is returned for events near midnight/time-zone boundaries. Fetch a
+    # slightly wider window, then the app performs the authoritative local
+    # time-zone filtering after parsing each event timestamp.
+    date_windows = [
+        today_str,
+        f"{yesterday.strftime('%Y%m%d')}-{tomorrow.strftime('%Y%m%d')}",
+    ]
 
-    # Same fallback for every sport. Some ESPN college feeds populate more
-    # reliably when a small date range is requested.
-    params = {**base_params, "dates": window_str}
-    response = requests.get(url, params=params, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
-    response.raise_for_status()
-    return response.json()
+    merged_events = {}
+    last_data = {"events": []}
+    for date_value in date_windows:
+        params = {**base_params, "dates": date_value}
+        response = requests.get(
+            url, params=params, timeout=12,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        response.raise_for_status()
+        data = response.json()
+        last_data = data
+        for event in data.get("events", []):
+            event_id = str(event.get("id", ""))
+            if event_id:
+                merged_events[event_id] = event
+
+    # Final fallback: ESPN's default scoreboard date. Some college feeds can
+    # temporarily return a sparse dated response, especially volleyball.
+    if not merged_events:
+        response = requests.get(
+            url, params=base_params, timeout=12,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        response.raise_for_status()
+        data = response.json()
+        for event in data.get("events", []):
+            event_id = str(event.get("id", ""))
+            if event_id:
+                merged_events[event_id] = event
+
+    return {"events": list(merged_events.values())} if merged_events else last_data
 
 
 @st.cache_data(ttl=20)
@@ -186,12 +213,16 @@ def render_game(game, favorite=False, close=False):
     if game["state"] == "in":
         clock = f" • Period {game['period']} • {game['clock']}" if game["clock"] else f" • Period {game['period']}"
 
+    start_time = ""
+    if game.get("event_time") and game["state"] == "pre":
+        start_time = game["event_time"].strftime("%I:%M %p %Z").lstrip("0")
+
     st.markdown(f"""
     <div class="game-card">
       <div class="meta">{game['sport']} • {meta}</div>
       <div class="team">{away_logo} {game['away']}<span class="score">{away_score}</span></div>
       <div class="team">{home_logo} {game['home']}<span class="score">{home_score}</span></div>
-      <div class="meta">Score difference: {game['diff']}{clock}</div>
+      <div class="meta">Score difference: {game['diff']}{clock}{(' • Start: ' + start_time) if start_time else ''}</div>
     </div>
     """, unsafe_allow_html=True)
 
