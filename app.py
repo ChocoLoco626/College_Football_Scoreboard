@@ -872,13 +872,14 @@ NCAA_SPORTS = {
 }
 
 
-@st.cache_data(ttl=20)
-def get_all_scoreboards(timezone_name, target_date=None):
-    """Fetch NCAA scoreboards for a selected local calendar date.
+@st.cache_data(ttl=1800, show_spinner=False)
+def _get_cached_scoreboard_snapshot(timezone_name, target_date):
+    """Build a relatively stable slate snapshot for the selected date.
 
-    Football is fetched by NCAA week, then the dashboard filters games by the
-    actual local event date. This is important because the NCAA football API
-    uses YYYY/WK routes rather than YYYY/MM/DD routes.
+    Upcoming and completed games live here for 30 minutes. Live score polling
+    is deliberately handled by get_all_scoreboards(), which only re-requests
+    NCAA feeds for games that are already live or whose scheduled start time
+    has passed.
     """
     combined = []
     errors = []
@@ -887,20 +888,13 @@ def get_all_scoreboards(timezone_name, target_date=None):
 
     for sport_name, configs in NCAA_SPORTS.items():
         for sport_slug, division in configs:
-            # Football endpoints are week-based; get_ncaa_scoreboard()
-            # resolves the selected date to the correct NCAA week, so adjacent
-            # calendar pages are unnecessary there. For date-based sports, the
-            # NCAA scoreboard calendar is effectively Eastern-time based. When
-            # the app is displaying Central Time, a late-night game can cross
-            # midnight during conversion (for example, 12:15 AM ET becomes
-            # 11:15 PM CT on the previous local date). Search the adjacent NCAA
-            # date pages automatically so those games are not lost.
             if sport_slug == "football":
                 dates_to_fetch = [target_date]
             elif timezone_name == "America/Chicago":
                 dates_to_fetch = [target_date - timedelta(days=1), target_date, target_date + timedelta(days=1)]
             else:
                 dates_to_fetch = [target_date]
+
             seen_ids = set()
             for fetch_date in dates_to_fetch:
                 try:
@@ -913,9 +907,6 @@ def get_all_scoreboards(timezone_name, target_date=None):
                         })
                     for event in data.get("events", []):
                         event["_sport_name"] = sport_name
-                        # Keep the NCAA source date for diagnostics/debugging,
-                        # while parse_games() continues to use the converted
-                        # local event timestamp as the final date filter.
                         event["_requested_ncaa_date"] = str(fetch_date)
                         event_id = str(event.get("id", ""))
                         if event_id and event_id in seen_ids:
@@ -928,11 +919,6 @@ def get_all_scoreboards(timezone_name, target_date=None):
                 except Exception as exc:
                     errors.append(f"{sport_name} ({sport_slug}/{division}, {fetch_date}): {type(exc).__name__}: {exc}")
 
-            # Schedule recovery: if the normal scoreboard feed missed a
-            # scheduled contest, consult the cached full-season schedule.
-            # This is especially important for future football games such as
-            # Kentucky-Louisville, which may not appear on the live scoreboard
-            # until NCAA publishes them into the date feed.
             try:
                 fallback_events = get_schedule_fallback_events(
                     sport_slug, division, sport_name, timezone_name, target_date
@@ -946,15 +932,122 @@ def get_all_scoreboards(timezone_name, target_date=None):
                         combined.append(event)
                         existing.add(event_id)
             except Exception as exc:
-                # Schedule recovery is supplemental; don't mark the entire
-                # scoreboard disconnected when this optional feed is down.
                 diagnostics.append({"sport": sport_name, "schedule_fallback_error": str(exc)})
+
+    return {
+        "events": combined,
+        "errors": errors,
+        "diagnostics": diagnostics,
+        "cached_at": datetime.now(ZoneInfo(timezone_name)).isoformat(),
+    }
+
+
+def _event_is_live_candidate(event, now_local):
+    """Return True when this event should be actively polled for score changes."""
+    if not isinstance(event, dict):
+        return False
+    status = str(event.get("gameState") or event.get("state") or "").lower()
+    if status in {"in", "live", "active"}:
+        return True
+    if status in {"post", "final", "completed"}:
+        return False
+    raw_date = event.get("date")
+    if isinstance(raw_date, str) and raw_date.strip():
+        try:
+            event_dt = datetime.fromisoformat(raw_date.replace("Z", "+00:00")).astimezone(now_local.tzinfo)
+            return event_dt <= now_local
+        except (TypeError, ValueError):
+            pass
+    return False
+
+
+def get_all_scoreboards(timezone_name, target_date=None):
+    """Return a cached slate plus live updates only for active games.
+
+    This is the key performance optimization: future games and already-final
+    games are served from the 30-minute snapshot. Every 30-second fragment
+    refresh only re-requests NCAA scoreboard feeds for sport/division feeds
+    containing a game that is live or whose scheduled start time has passed.
+    """
+    target_date = target_date or today_in_timezone(timezone_name)
+    snapshot = _get_cached_scoreboard_snapshot(timezone_name, target_date)
+    combined = list(snapshot.get("events", []))
+    errors = list(snapshot.get("errors", []))
+    diagnostics = list(snapshot.get("diagnostics", []))
+    now_local = datetime.now(ZoneInfo(timezone_name))
+
+    # Group the cached events by exact NCAA sport/division configuration so we
+    # can poll only the feeds that currently contain an active game.
+    for sport_name, configs in NCAA_SPORTS.items():
+        for sport_slug, division in configs:
+            candidates = [
+                event for event in combined
+                if event.get("_sport_name") == sport_name
+                and event.get("_division") == division
+                and _event_is_live_candidate(event, now_local)
+            ]
+            if not candidates:
+                continue
+
+            # Poll the same date pages used by the original snapshot logic.
+            if sport_slug == "football":
+                dates_to_fetch = [target_date]
+            elif timezone_name == "America/Chicago":
+                dates_to_fetch = [target_date - timedelta(days=1), target_date, target_date + timedelta(days=1)]
+            else:
+                dates_to_fetch = [target_date]
+
+            refreshed = []
+            seen_ids = set()
+            for fetch_date in dates_to_fetch:
+                try:
+                    data = get_ncaa_scoreboard(sport_slug, division, sport_name, timezone_name, fetch_date)
+                    if data.get("_diagnostic"):
+                        diagnostics.append({
+                            "sport": sport_name,
+                            "requested_date": str(fetch_date),
+                            **data["_diagnostic"],
+                        })
+                    for event in data.get("events", []):
+                        event["_sport_name"] = sport_name
+                        event["_requested_ncaa_date"] = str(fetch_date)
+                        event_id = str(event.get("id", ""))
+                        if event_id and event_id in seen_ids:
+                            continue
+                        if event_id:
+                            seen_ids.add(event_id)
+                        refreshed.append(event)
+                except requests.RequestException as exc:
+                    errors.append(f"{sport_name} ({sport_slug}/{division}, {fetch_date}): {exc}")
+                except Exception as exc:
+                    errors.append(f"{sport_name} ({sport_slug}/{division}, {fetch_date}): {type(exc).__name__}: {exc}")
+
+            if refreshed:
+                # Replace only events belonging to this sport/division. Any
+                # future/final games missing from the refreshed feed remain in
+                # the cached snapshot instead of disappearing from the UI.
+                refreshed_by_id = {str(e.get("id")): e for e in refreshed if e.get("id")}
+                new_combined = []
+                for event in combined:
+                    if event.get("_sport_name") == sport_name and event.get("_division") == division:
+                        event_id = str(event.get("id", ""))
+                        if event_id in refreshed_by_id:
+                            new_combined.append(refreshed_by_id.pop(event_id))
+                        else:
+                            new_combined.append(event)
+                    else:
+                        new_combined.append(event)
+                # Add genuinely new events discovered by the live poll.
+                new_combined.extend(refreshed_by_id.values())
+                combined = new_combined
+
     fetched_at = datetime.now(ZoneInfo(timezone_name)).isoformat()
     return {
         "events": combined,
         "errors": errors,
         "diagnostics": diagnostics,
         "fetched_at": fetched_at,
+        "snapshot_cached_at": snapshot.get("cached_at"),
     }
 
 
