@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 import base64
+import re
 import requests
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -558,7 +559,10 @@ def get_volleyball_set_info(game_id, away_id="", home_id=""):
 
     payloads = [payload] if payload else []
     if payload:
-        rows = _extract_volleyball_set_scores(payload, away_id, home_id)
+        try:
+            rows = _extract_volleyball_set_scores(payload, away_id, home_id)
+        except Exception:
+            rows = []
         if rows:
             payloads = [payload]
         else:
@@ -573,7 +577,10 @@ def get_volleyball_set_info(game_id, away_id="", home_id=""):
             pass
 
     for payload in payloads:
-        rows = _extract_volleyball_set_scores(payload, away_id, home_id)
+        try:
+            rows = _extract_volleyball_set_scores(payload, away_id, home_id)
+        except Exception:
+            rows = []
         if not rows:
             continue
         away_points = [r["Away"] for r in rows]
@@ -1554,7 +1561,7 @@ def apply_espn_volleyball_fallback(games, target_date):
             break
     return games
 
-def parse_games(data, timezone_name, target_date=None):
+def parse_games(data, timezone_name, target_date=None, fetch_volleyball_details=True):
     games = []
     for event in data.get("events", []):
         competition = (event.get("competitions") or [{}])[0]
@@ -1631,7 +1638,8 @@ def parse_games(data, timezone_name, target_date=None):
     # NCAA scoreboard still refreshes every 30 seconds.
     volleyball_games = [
         game for game in games
-        if game.get("sport") == "🏐 Women's Volleyball" and game.get("state") in ("in", "post")
+        if fetch_volleyball_details
+        and game.get("sport") == "🏐 Women's Volleyball" and game.get("state") in ("in", "post")
         and game.get("id") and not str(game.get("id")).startswith("ncaa-")
     ]
 
@@ -1660,7 +1668,8 @@ def parse_games(data, timezone_name, target_date=None):
                 game["volleyball_current_home"] = info.get("current_set_home") if info.get("current_set_home") is not None else game.get("volleyball_current_home")
                 game["diff"] = abs(info["away_sets"] - info["home_sets"])
 
-    games = apply_espn_volleyball_fallback(games, target_date)
+    if fetch_volleyball_details:
+        games = apply_espn_volleyball_fallback(games, target_date)
     return games
 
 
@@ -1893,18 +1902,43 @@ def _late_close_reason(game, close_thresholds):
 
 
 def _volleyball_set_scoreboard(game):
-    """Compact ESPN/NCAA-style set-by-set score table for volleyball cards."""
+    """Render a compact NCAA-style volleyball linescore table."""
     rows = game.get("volleyball_set_scores") or []
     if not rows:
         return ""
-    headers = "".join(f'<span>{r["Set"]}</span>' for r in rows)
-    away = "".join(f'<span>{r["Away"]}</span>' for r in rows)
-    home = "".join(f'<span>{r["Home"]}</span>' for r in rows)
+
+    # Keep the columns in set order and remove duplicate labels. The NCAA card
+    # only shows sets that have started, followed by the total sets column.
+    cleaned = []
+    seen = set()
+    for idx, row in enumerate(rows, start=1):
+        try:
+            set_label = str(row.get("Set") or idx)
+            a = int(row.get("Away"))
+            h = int(row.get("Home"))
+        except (TypeError, ValueError):
+            continue
+        if set_label in seen:
+            continue
+        seen.add(set_label)
+        cleaned.append((set_label, a, h))
+
+    if not cleaned:
+        return ""
+
+    n = len(cleaned)
+    grid = f"minmax(105px,1fr) repeat({n},28px) 32px"
+    headers = "".join(f'<span>{label}</span>' for label, _, _ in cleaned)
+    away = "".join(f'<span>{a}</span>' for _, a, _ in cleaned)
+    home = "".join(f'<span>{h}</span>' for _, _, h in cleaned)
+    away_total = game.get("away_score", 0)
+    home_total = game.get("home_score", 0)
+
     return (
         '<div class="vb-set-table">'
-        f'<div class="vb-set-label"><span></span>{headers}<span>T</span></div>'
-        f'<div class="vb-set-row"><strong>{game.get("away", "Away")}</strong>{away}<b>{game.get("away_score", 0)}</b></div>'
-        f'<div class="vb-set-row"><strong>{game.get("home", "Home")}</strong>{home}<b>{game.get("home_score", 0)}</b></div>'
+        f'<div class="vb-set-label" style="grid-template-columns:{grid}"><span></span>{headers}<span>T</span></div>'
+        f'<div class="vb-set-row" style="grid-template-columns:{grid}"><strong>{game.get("away", "Away")}</strong>{away}<b>{away_total}</b></div>'
+        f'<div class="vb-set-row" style="grid-template-columns:{grid}"><strong>{game.get("home", "Home")}</strong>{home}<b>{home_total}</b></div>'
         '</div>'
     )
 
@@ -2171,7 +2205,7 @@ def render_conference_standings(selected_sport, selected_conference=""):
 
 
 @st.fragment(run_every="30s")
-def live_dashboard(timezone_label, selected_timezone, sport_filter, close_thresholds, conference_filter, top25_only, date_offset, live_only, favorites_only, compact_mode):
+def live_dashboard(timezone_label, selected_timezone, sport_filter, close_thresholds, conference_filter, top25_only, date_offset, live_only, favorites_only, compact_mode, other_live_only):
     st.title("🏆 College Sports Live")
     selected_date = today_in_timezone(selected_timezone) + timedelta(days=date_offset)
     if date_offset == 0:
@@ -2188,7 +2222,7 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, close_thresh
         refresh_started = time.perf_counter()
         data = get_all_scoreboards(selected_timezone, selected_date, sport_filter)
         refresh_duration = time.perf_counter() - refresh_started
-        games = parse_games(data, selected_timezone, selected_date)
+        games = parse_games(data, selected_timezone, selected_date, fetch_volleyball_details=not other_live_only)
         games = dedupe_games(games)
 
         # The NCAA football scoreboard can sometimes return the next slate of
@@ -2284,6 +2318,28 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, close_thresh
 
     c1,c2,c3,c4,c5,c6 = st.columns(6)
     c1.metric("🔴 Live", len(live_games)); c2.metric("🔥 Close", len(close_games)); c3.metric("📺 Other Live", len(other_live_games)); c4.metric("⭐ My Teams", len(favorite_games)); c5.metric("🏆 Games", len(games)); c6.metric("🔔 Alerts", sum(bool(st.session_state.get(_alert_key(g["id"]), False)) for g in all_games_for_alerts))
+
+    if other_live_only:
+        st.info("📺 Other Live Games Only is on. Close, final, and upcoming sections are hidden, and extra volleyball detail requests are skipped for faster loading.")
+        st.markdown("---")
+        st.subheader("📺 Other Live Games")
+        other_live_sorted = sorted(
+            other_live_games,
+            key=lambda g: (g.get("event_time") or datetime.max.replace(tzinfo=ZoneInfo(selected_timezone)), g.get("diff", 999))
+        )
+        if not other_live_sorted:
+            st.info("No other live games match the current filters.")
+        for i, game in enumerate(other_live_sorted):
+            render_alert_toggle(game, "other-live", i)
+            render_game(
+                {**game, "_render_context":"other-live"},
+                favorite=is_favorite(game, favorites),
+                close=False,
+                rankings=ranking_maps.get(game["sport"], {}),
+                records=record_maps.get(game["sport"], {}),
+                compact=compact_mode,
+            )
+        return
 
     st.markdown("---")
     st.subheader("⭐ My Teams")
@@ -2466,6 +2522,11 @@ with st.sidebar:
     conference_filter = st.multiselect("🏟️ Conferences", conference_options, default=[])
     top25_only = st.checkbox("🏆 Top 25 teams only", value=False)
     live_only = st.checkbox("🔴 Live games only", value=False)
+    other_live_only = st.checkbox(
+        "📺 Other live games only",
+        value=False,
+        help="Show only live games outside the close-game threshold. This also skips the extra volleyball set-detail requests for faster loading."
+    )
     favorites_only = st.checkbox("⭐ My Teams only", value=False)
     with st.expander("🔥 Close-game settings", expanded=False):
         st.caption("Set the score margin that counts as a close game for each sport. Volleyball uses set margin; its points-per-set scores are shown separately. A game at the threshold is included.")
@@ -2509,5 +2570,5 @@ with st.sidebar:
 
 if not sport_filter:
     st.info("Select one or more sports in the sidebar to load scores. No score feeds are requested until you choose a sport.")
-live_dashboard(timezone_label, selected_timezone, sport_filter, close_thresholds, conference_filter, top25_only, date_offset, live_only, favorites_only, compact_mode)
+live_dashboard(timezone_label, selected_timezone, sport_filter, close_thresholds, conference_filter, top25_only, date_offset, live_only, favorites_only, compact_mode, other_live_only)
 
