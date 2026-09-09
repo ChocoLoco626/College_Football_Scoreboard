@@ -3,6 +3,7 @@ from zoneinfo import ZoneInfo
 import base64
 import requests
 import streamlit as st
+from matchups import format_matchup_badges
 
 REFRESH_SECONDS = 30
 TIMEZONES = {
@@ -509,6 +510,25 @@ def get_ncaa_scoreboard(sport_slug, division, sport_name, timezone_name, target_
         away_score = safe_score(away)
         home_score = safe_score(home)
 
+        # Preserve any event/tournament/championship metadata exposed by the NCAA feed.
+        context_values = []
+        for key in (
+            "eventName", "event_name", "contestName", "contest_name", "tournamentName",
+            "tournament_name", "roundName", "round_name", "championshipName",
+            "championship_name", "title", "description", "notes", "seasonType",
+        ):
+            value = game.get(key)
+            if value not in (None, "", []):
+                context_values.append(str(value))
+        event_context = " | ".join(dict.fromkeys(context_values))
+        event_name = (
+            game.get("eventName") or game.get("event_name") or game.get("contestName")
+            or game.get("contest_name") or game.get("tournamentName") or game.get("tournament_name")
+            or ""
+        )
+        tournament_name = game.get("tournamentName") or game.get("tournament_name") or ""
+        round_name = game.get("roundName") or game.get("round_name") or ""
+
         # Normalize NCAA's response into the same shape the existing renderer uses.
         events.append({
             "id": game_id,
@@ -530,6 +550,10 @@ def get_ncaa_scoreboard(sport_slug, division, sport_name, timezone_name, target_
                 "broadcasts": ([{"names": [game.get("network")]}] if game.get("network") else []),
                 "_venue": game.get("venue") or game.get("venueName") or game.get("location") or "",
             }],
+            "_event_name": event_name,
+            "_event_context": event_context,
+            "_tournament_name": tournament_name,
+            "_round_name": round_name,
             "_sport_name": sport_name,
             "_sport": sport_slug,
             "_league": sport_slug,
@@ -809,6 +833,10 @@ def parse_games(data, timezone_name):
             "period": status.get("period", ""),
             "broadcasts": [n for b in competition.get("broadcasts", []) for n in b.get("names", [])],
             "venue": event.get("_venue", ""),
+            "event_name": event.get("_event_name", ""),
+            "event_context": event.get("_event_context", ""),
+            "tournament_name": event.get("_tournament_name", ""),
+            "round_name": event.get("_round_name", ""),
         })
     return games
 
@@ -1007,6 +1035,7 @@ def _upcoming_countdown(event_time):
 def render_game(game, favorite=False, close=False, rankings=None, records=None, compact=False):
     status_badge = "🔴 LIVE NOW" if game["state"] == "in" else ("FINAL" if game["state"] == "post" else "UPCOMING")
     live_detail = _live_status_text(game)
+    matchup_badges = format_matchup_badges(game)
     meta = " • ".join(x for x in [
         status_badge,
         game["division"],
@@ -1015,6 +1044,7 @@ def render_game(game, favorite=False, close=False, rankings=None, records=None, 
         live_detail or game["detail"],
         f"TV: {', '.join(game['broadcasts'])}" if game["broadcasts"] else "",
     ] if x)
+    matchup_meta = "<br>" + " &nbsp;•&nbsp; ".join(matchup_badges) if matchup_badges else ""
 
     away_logo_url = game.get("away_logo", "")
     home_logo_url = game.get("home_logo", "")
@@ -1052,7 +1082,7 @@ def render_game(game, favorite=False, close=False, rankings=None, records=None, 
     card_class = "game-card compact-game-card" if compact else "game-card"
     st.markdown(f"""
     <div class="{card_class}">
-      <div class="meta">{game['sport']} • {meta}</div>
+      <div class="meta">{game['sport']} • {meta}{matchup_meta}</div>
       <div class="team">{away_logo}{away_label}{game['away']} ✈️<span class="score">{away_score}</span></div>
       <div class="team">{home_logo}{home_label}{game['home']} 🏠<span class="score">{home_score}</span></div>
       <div class="meta">Score difference: {game['diff']}{change_html}{clock}{start_meta}</div>
@@ -1448,6 +1478,8 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, c
 
                         alert = bool(st.session_state.get(_alert_key(game["id"]), False))
                         alert_text = " • 🔔" if alert else ""
+                        matchup_badges = format_matchup_badges(game)
+                        matchup_text = " • ".join(matchup_badges)
                         result_text = "vs" if is_home else "at"
                         favorite_icon = "🏠" if is_home else "✈️"
                         opponent_icon = "✈️" if is_home else "🏠"
@@ -1455,7 +1487,7 @@ def live_dashboard(timezone_label, selected_timezone, sport_filter, threshold, c
                         opponent_label = f"{opponent}{f' ({opponent_record})' if opponent_record else ''} {opponent_icon}"
                         game_rows.append(
                             f'<div class="myteam-game-row">'
-                            f'<div class="myteam-status">{result_prefix + " • " if result_prefix else ""}{status}{alert_text} • {game["sport"]}</div>'
+                            f'<div class="myteam-status">{result_prefix + " • " if result_prefix else ""}{status}{alert_text} • {game["sport"]}{(" • " + matchup_text) if matchup_text else ""}</div>'
                             f'<div class="myteam-score">{score}</div>'
                             f'<div class="myteam-opponent">{favorite_team_label} {result_text} {opponent_label}</div>'
                             f'</div>'
