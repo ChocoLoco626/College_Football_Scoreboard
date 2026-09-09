@@ -56,6 +56,77 @@ def today_in_timezone(timezone_name):
     return datetime.now(ZoneInfo(timezone_name)).date()
 
 
+def get_ncaa_volleyball_scoreboard(timezone_name):
+    """Reliable Division I women's volleyball fallback using the NCAA scoreboard feed.
+
+    ESPN's public volleyball scoreboard is currently inconsistent for upcoming
+    matches even though ESPN's own web scoreboard lists them. The NCAA D-I
+    scoreboard provides the same contests and is used as the primary volleyball
+    source, with ESPN remaining the source for the other sports.
+    """
+    local_date = today_in_timezone(timezone_name)
+    date_path = local_date.strftime("%Y/%m/%d")
+    url = f"https://ncaa-api.henrygd.me/scoreboard/volleyball-women/d1/{date_path}"
+    response = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+    response.raise_for_status()
+    payload = response.json()
+
+    events = []
+    for item in payload.get("games", []):
+        game = item.get("game", item) if isinstance(item, dict) else {}
+        if not isinstance(game, dict):
+            continue
+        away = game.get("away", {}) or {}
+        home = game.get("home", {}) or {}
+        away_names = away.get("names", {}) or {}
+        home_names = home.get("names", {}) or {}
+        away_name = away_names.get("full") or away_names.get("short") or "Away"
+        home_name = home_names.get("full") or home_names.get("short") or "Home"
+        game_id = str(game.get("gameID") or game.get("gameId") or "ncaa-" + away_name + "-" + home_name)
+
+        start = game.get("startTime") or game.get("startTimeEpoch") or game.get("date")
+        event_date = local_date
+        event_dt = None
+        if isinstance(start, (int, float)) or (isinstance(start, str) and start.isdigit()):
+            event_dt = datetime.fromtimestamp(float(start) / 1000 if float(start) > 100000000000 else float(start), tz=ZoneInfo("UTC")).astimezone(ZoneInfo(timezone_name))
+            event_date = event_dt.date()
+        elif isinstance(start, str) and start:
+            try:
+                event_dt = datetime.fromisoformat(start.replace("Z", "+00:00")).astimezone(ZoneInfo(timezone_name))
+                event_date = event_dt.date()
+            except ValueError:
+                pass
+
+        state_raw = str(game.get("gameState", game.get("status", "P"))).upper()
+        state = "in" if state_raw in ("I", "LIVE", "IN") else ("post" if state_raw in ("F", "FINAL", "POST") else "pre")
+        try:
+            away_score = int(away.get("score", 0))
+        except (TypeError, ValueError):
+            away_score = 0
+        try:
+            home_score = int(home.get("score", 0))
+        except (TypeError, ValueError):
+            home_score = 0
+
+        events.append({
+            "id": game_id,
+            "date": event_dt.isoformat() if event_dt else None,
+            "status": {"type": {"state": state, "shortDetail": game.get("statusDetail", "")}},
+            "competitions": [{
+                "competitors": [
+                    {"homeAway": "away", "team": {"id": str(away.get("id", "")), "displayName": away_name, "logo": away.get("logo", "")}, "score": str(away_score)},
+                    {"homeAway": "home", "team": {"id": str(home.get("id", "")), "displayName": home_name, "logo": home.get("logo", "")}, "score": str(home_score)},
+                ],
+                "broadcasts": [],
+            }],
+            "_sport_name": "🏐 Women's Volleyball",
+            "_sport": "volleyball",
+            "_league": "womens-college-volleyball",
+            "_division": "NCAA D-I",
+        })
+    return {"events": events}
+
+
 def get_scoreboard(sport, league, group=None, timezone_name=TIMEZONES[DEFAULT_TIMEZONE]):
     """Fetch today's ESPN schedule, with a tomorrow-inclusive fallback.
 
@@ -131,7 +202,10 @@ def get_all_scoreboards(timezone_name):
     for sport_name, configs in SPORTS.items():
         for sport, league, division, group in configs:
             try:
-                data = get_scoreboard(sport, league, group, timezone_name)
+                if sport_name == "🏐 Women's Volleyball":
+                    data = get_ncaa_volleyball_scoreboard(timezone_name)
+                else:
+                    data = get_scoreboard(sport, league, group, timezone_name)
                 for event in data.get("events", []):
                     event["_sport_name"] = sport_name
                     event["_sport"] = sport
